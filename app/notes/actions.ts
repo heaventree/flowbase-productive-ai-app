@@ -2,10 +2,9 @@
 
 import { GoogleGenAI } from "@google/genai";
 import { currentUser } from "@clerk/nextjs/server";
-import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { db, notes, users } from "@/db";
+import { supabase } from "@/db";
 import { assertAiFeatureEnabled, assertFreePlanLimit, recordAiAction } from "@/lib/user-preferences";
 
 const noteColors = ["sage", "clay", "amber", "sky", "violet"] as const;
@@ -78,7 +77,7 @@ function countWords(value: string) {
   return words?.length ?? 0;
 }
 
-function toDTO(note: typeof notes.$inferSelect): NoteDTO {
+function toDTO(note: any): NoteDTO {
   return {
     id: note.id,
     title: note.title,
@@ -86,13 +85,13 @@ function toDTO(note: typeof notes.$inferSelect): NoteDTO {
     color: normalizeColor(note.color),
     category: normalizeCategory(note.category),
     content: note.content,
-    plainText: note.plainText,
-    wordCount: note.wordCount,
-    isPinned: note.isPinned,
-    isTrashed: note.isTrashed,
-    trashedAt: note.trashedAt?.toISOString() ?? null,
-    createdAt: note.createdAt.toISOString(),
-    updatedAt: note.updatedAt.toISOString(),
+    plainText: note.plain_text,
+    wordCount: note.word_count,
+    isPinned: note.is_pinned,
+    isTrashed: note.is_trashed,
+    trashedAt: note.trashed_at ?? null,
+    createdAt: note.created_at,
+    updatedAt: note.updated_at,
   };
 }
 
@@ -113,22 +112,23 @@ async function getCurrentDatabaseUserId() {
 
   const name = user.fullName || user.username || email.split("@")[0] || null;
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email, name },
-    })
-    .returning({ id: users.id });
+  const { data, error } = await supabase
+    .from("users")
+    .upsert({ clerk_id: clerkId, email, name }, { onConflict: "clerk_id" })
+    .select("id")
+    .single();
 
-  return databaseUser.id;
+  if (error) throw new Error(error.message);
+  return data.id;
 }
 
 async function assertNoteAccess(noteId: number, userId: number) {
-  const note = await db.query.notes.findFirst({
-    where: and(eq(notes.id, noteId), eq(notes.userId, userId)),
-  });
+  const { data: note } = await supabase
+    .from("notes")
+    .select("*")
+    .eq("id", noteId)
+    .eq("user_id", userId)
+    .maybeSingle();
 
   if (!note) {
     throw new Error("Note not found.");
@@ -139,65 +139,77 @@ async function assertNoteAccess(noteId: number, userId: number) {
 
 export async function listNotes() {
   const userId = await getCurrentDatabaseUserId();
-  const userNotes = await db.query.notes.findMany({
-    where: eq(notes.userId, userId),
-  });
+  const { data: userNotes } = await supabase
+    .from("notes")
+    .select("*")
+    .eq("user_id", userId);
 
-  return userNotes.map(toDTO).sort(sortNotes);
+  return (userNotes ?? []).map(toDTO).sort(sortNotes);
 }
 
 export async function createNote() {
   await assertFreePlanLimit("notes");
   const userId = await getCurrentDatabaseUserId();
-  const now = new Date();
-  const [note] = await db
-    .insert(notes)
-    .values({
-      userId,
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("notes")
+    .insert({
+      user_id: userId,
       title: "Untitled",
       content: emptyContent,
-      plainText: "",
-      wordCount: 0,
-      updatedAt: now,
+      plain_text: "",
+      word_count: 0,
+      updated_at: now,
     })
-    .returning();
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/notes");
-  return toDTO(note);
+  return toDTO(data);
 }
 
 export async function updateNoteTitle(noteId: number, title: string) {
   const userId = await getCurrentDatabaseUserId();
   await assertNoteAccess(noteId, userId);
 
-  const [note] = await db
-    .update(notes)
-    .set({ title: cleanTitle(title), updatedAt: new Date() })
-    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)))
-    .returning();
+  const { data, error } = await supabase
+    .from("notes")
+    .update({ title: cleanTitle(title), updated_at: new Date().toISOString() })
+    .eq("id", noteId)
+    .eq("user_id", userId)
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/notes");
-  return toDTO(note);
+  return toDTO(data);
 }
 
 export async function updateNoteMetadata(noteId: number, input: NoteMetadataInput) {
   const userId = await getCurrentDatabaseUserId();
   const note = await assertNoteAccess(noteId, userId);
 
-  const [updatedNote] = await db
-    .update(notes)
-    .set({
+  const { data, error } = await supabase
+    .from("notes")
+    .update({
       color: input.color ? normalizeColor(input.color) : note.color,
       icon: input.icon ? normalizeIcon(input.icon) : note.icon,
       category: typeof input.category !== "undefined" ? normalizeCategory(input.category) : note.category,
-      isPinned: typeof input.isPinned === "boolean" ? input.isPinned : note.isPinned,
-      updatedAt: new Date(),
+      is_pinned: typeof input.isPinned === "boolean" ? input.isPinned : note.is_pinned,
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)))
-    .returning();
+    .eq("id", noteId)
+    .eq("user_id", userId)
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/notes");
-  return toDTO(updatedNote);
+  return toDTO(data);
 }
 
 export async function updateNoteContent(noteId: number, input: NoteContentInput) {
@@ -205,61 +217,68 @@ export async function updateNoteContent(noteId: number, input: NoteContentInput)
   await assertNoteAccess(noteId, userId);
   const plainText = cleanPlainText(input.plainText);
 
-  const [note] = await db
-    .update(notes)
-    .set({
+  const { data, error } = await supabase
+    .from("notes")
+    .update({
       content: input.content,
-      plainText,
-      wordCount: Math.max(0, Number.isFinite(input.wordCount) ? input.wordCount : countWords(plainText)),
-      updatedAt: new Date(),
+      plain_text: plainText,
+      word_count: Math.max(0, Number.isFinite(input.wordCount) ? input.wordCount : countWords(plainText)),
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(notes.id, noteId), eq(notes.userId, userId), eq(notes.isTrashed, false)))
-    .returning();
+    .eq("id", noteId)
+    .eq("user_id", userId)
+    .eq("is_trashed", false)
+    .select()
+    .single();
 
-  if (!note) {
+  if (error || !data) {
     throw new Error("Note not found.");
   }
 
   revalidatePath("/notes");
-  return toDTO(note);
+  return toDTO(data);
 }
 
 export async function duplicateNote(noteId: number) {
   await assertFreePlanLimit("notes");
   const userId = await getCurrentDatabaseUserId();
   const source = await assertNoteAccess(noteId, userId);
-  const now = new Date();
+  const now = new Date().toISOString();
 
-  const [note] = await db
-    .insert(notes)
-    .values({
-      userId,
+  const { data, error } = await supabase
+    .from("notes")
+    .insert({
+      user_id: userId,
       title: `${source.title} copy`,
       icon: source.icon,
       color: source.color,
       category: source.category,
       content: source.content,
-      plainText: source.plainText,
-      wordCount: source.wordCount,
-      isPinned: false,
-      isTrashed: false,
-      trashedAt: null,
-      updatedAt: now,
+      plain_text: source.plain_text,
+      word_count: source.word_count,
+      is_pinned: false,
+      is_trashed: false,
+      trashed_at: null,
+      updated_at: now,
     })
-    .returning();
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/notes");
-  return toDTO(note);
+  return toDTO(data);
 }
 
 export async function trashNote(noteId: number) {
   const userId = await getCurrentDatabaseUserId();
   await assertNoteAccess(noteId, userId);
 
-  await db
-    .update(notes)
-    .set({ isTrashed: true, isPinned: false, trashedAt: new Date(), updatedAt: new Date() })
-    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)));
+  await supabase
+    .from("notes")
+    .update({ is_trashed: true, is_pinned: false, trashed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq("id", noteId)
+    .eq("user_id", userId);
 
   revalidatePath("/notes");
   return listNotes();
@@ -269,21 +288,30 @@ export async function restoreNote(noteId: number) {
   const userId = await getCurrentDatabaseUserId();
   await assertNoteAccess(noteId, userId);
 
-  const [note] = await db
-    .update(notes)
-    .set({ isTrashed: false, trashedAt: null, updatedAt: new Date() })
-    .where(and(eq(notes.id, noteId), eq(notes.userId, userId)))
-    .returning();
+  const { data, error } = await supabase
+    .from("notes")
+    .update({ is_trashed: false, trashed_at: null, updated_at: new Date().toISOString() })
+    .eq("id", noteId)
+    .eq("user_id", userId)
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/notes");
-  return toDTO(note);
+  return toDTO(data);
 }
 
 export async function deleteNoteForever(noteId: number) {
   const userId = await getCurrentDatabaseUserId();
   await assertNoteAccess(noteId, userId);
 
-  await db.delete(notes).where(and(eq(notes.id, noteId), eq(notes.userId, userId), eq(notes.isTrashed, true)));
+  await supabase
+    .from("notes")
+    .delete()
+    .eq("id", noteId)
+    .eq("user_id", userId)
+    .eq("is_trashed", true);
 
   revalidatePath("/notes");
   return listNotes();

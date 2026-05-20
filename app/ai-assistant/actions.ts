@@ -1,7 +1,6 @@
 "use server";
 
 import { GoogleGenAI } from "@google/genai";
-import { and, eq } from "drizzle-orm";
 
 import { generateGeneratedApp } from "@/app/ai-template-builder/actions";
 import { createCalendarItem } from "@/app/calendar/actions";
@@ -9,7 +8,7 @@ import { createKanbanBoard, createKanbanTask, listKanbanBoards } from "@/app/kan
 import { createNote, listNotes, updateNoteContent, updateNoteTitle } from "@/app/notes/actions";
 import { updateUserSettings } from "@/app/settings/actions";
 import { createWhiteboard, generateWhiteboardDiagram } from "@/app/whiteboard/actions";
-import { calendarItems, db, generatedApps, userSettings, whiteboards } from "@/db";
+import { supabase } from "@/db";
 import { getCurrentDatabaseUser, recordAiAction } from "@/lib/user-preferences";
 
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
@@ -150,9 +149,13 @@ function cleanAssistantResponse(value: Record<string, unknown>): AssistantRespon
 
 async function assertAssistantEnabled() {
   const user = await getCurrentDatabaseUser();
-  const settings = await db.query.userSettings.findFirst({ where: eq(userSettings.userId, user.id) });
+  const { data: settings } = await supabase
+    .from("user_settings")
+    .select("ai_assistant_enabled")
+    .eq("user_id", user.id)
+    .maybeSingle();
 
-  if (settings && !settings.aiAssistantEnabled) {
+  if (settings && !settings.ai_assistant_enabled) {
     throw new Error("AI Assistant is disabled in Settings.");
   }
 
@@ -161,13 +164,14 @@ async function assertAssistantEnabled() {
 
 export async function getAssistantSnapshot() {
   const user = await assertAssistantEnabled();
-  const [boards, notes, calendar, boardsOnly, apps, settings] = await Promise.all([
+
+  const [boards, notes, { data: calendar }, { data: boardsOnly }, { data: apps }, { data: settings }] = await Promise.all([
     listKanbanBoards(),
     listNotes(),
-    db.query.calendarItems.findMany({ where: eq(calendarItems.userId, user.id) }),
-    db.query.whiteboards.findMany({ where: eq(whiteboards.userId, user.id) }),
-    db.query.generatedApps.findMany({ where: eq(generatedApps.userId, user.id) }),
-    db.query.userSettings.findFirst({ where: eq(userSettings.userId, user.id) }),
+    supabase.from("calendar_items").select("*").eq("user_id", user.id),
+    supabase.from("whiteboards").select("*").eq("user_id", user.id),
+    supabase.from("generated_apps").select("*").eq("user_id", user.id),
+    supabase.from("user_settings").select("*").eq("user_id", user.id).maybeSingle(),
   ]);
 
   return {
@@ -182,14 +186,14 @@ export async function getAssistantSnapshot() {
         taskCount: column.tasks.length,
       })),
     })),
-    calendarItems: calendar.slice(-40).map((item) => ({
+    calendarItems: (calendar ?? []).slice(-40).map((item: any) => ({
       id: item.id,
       title: item.title,
-      itemType: item.itemType,
-      scheduledDate: item.scheduledDate,
-      scheduledTime: item.scheduledTime,
+      itemType: item.item_type,
+      scheduledDate: item.scheduled_date,
+      scheduledTime: item.scheduled_time,
       category: item.category,
-      isDraft: item.isDraft,
+      isDraft: item.is_draft,
     })),
     notes: notes.slice(0, 30).map((note) => ({
       id: note.id,
@@ -200,27 +204,27 @@ export async function getAssistantSnapshot() {
       updatedAt: note.updatedAt,
       preview: note.plainText.slice(0, 700),
     })),
-    whiteboards: boardsOnly.map((board) => ({
+    whiteboards: (boardsOnly ?? []).map((board: any) => ({
       id: board.id,
       name: board.name,
       color: board.color,
-      updatedAt: board.updatedAt.toISOString(),
+      updatedAt: board.updated_at,
     })),
-    generatedApps: apps.map((app) => ({
+    generatedApps: (apps ?? []).map((app: any) => ({
       id: app.id,
-      appName: app.appName,
+      appName: app.app_name,
       description: app.description,
-      isInSidebar: app.isInSidebar,
+      isInSidebar: app.is_in_sidebar,
     })),
     settings: settings
       ? {
-          theme: settings.theme,
-          notificationsEnabled: settings.notificationsEnabled,
-          defaultCalendarView: settings.defaultCalendarView,
-          defaultTaskPriority: settings.defaultTaskPriority,
-          aiModel: settings.aiModel,
-          aiBehavior: settings.aiBehavior,
-          aiTone: settings.aiTone,
+          theme: (settings as any).theme,
+          notificationsEnabled: (settings as any).notifications_enabled,
+          defaultCalendarView: (settings as any).default_calendar_view,
+          defaultTaskPriority: (settings as any).default_task_priority,
+          aiModel: (settings as any).ai_model,
+          aiBehavior: (settings as any).ai_behavior,
+          aiTone: (settings as any).ai_tone,
         }
       : null,
   };

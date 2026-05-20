@@ -1,10 +1,9 @@
 "use server";
 
 import { currentUser } from "@clerk/nextjs/server";
-import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { calendarItems, db, users } from "@/db";
+import { supabase } from "@/db";
 import { assertFreePlanLimit } from "@/lib/user-preferences";
 
 const itemTypes = ["task", "reminder"] as const;
@@ -47,18 +46,18 @@ function cleanOptionalText(value?: string | null) {
   return trimmed ? trimmed : null;
 }
 
-function toDTO(item: typeof calendarItems.$inferSelect): CalendarItemDTO {
+function toDTO(item: any): CalendarItemDTO {
   return {
     id: item.id,
     title: item.title,
     description: item.description,
-    itemType: normalizeType(item.itemType),
+    itemType: normalizeType(item.item_type),
     category: normalizeCategory(item.category),
-    scheduledDate: item.scheduledDate,
-    scheduledTime: item.scheduledTime,
-    isDraft: item.isDraft,
-    createdAt: item.createdAt.toISOString(),
-    updatedAt: item.updatedAt.toISOString(),
+    scheduledDate: item.scheduled_date,
+    scheduledTime: item.scheduled_time,
+    isDraft: item.is_draft,
+    createdAt: item.created_at,
+    updatedAt: item.updated_at,
   };
 }
 
@@ -73,25 +72,20 @@ async function getCurrentDatabaseUserId() {
 
   const name = user.fullName || user.username || email.split("@")[0] || null;
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email, name },
-    })
-    .returning({ id: users.id });
+  const { data, error } = await supabase
+    .from("users")
+    .upsert({ clerk_id: clerkId, email, name }, { onConflict: "clerk_id" })
+    .select("id")
+    .single();
 
-  return databaseUser.id;
+  if (error) throw new Error(error.message);
+  return data.id;
 }
 
 export async function listCalendarItems() {
   const userId = await getCurrentDatabaseUserId();
-  const items = await db.query.calendarItems.findMany({
-    where: eq(calendarItems.userId, userId),
-  });
-
-  return items.map(toDTO);
+  const { data: items } = await supabase.from("calendar_items").select("*").eq("user_id", userId);
+  return (items ?? []).map(toDTO);
 }
 
 export async function createCalendarItem(input: CalendarItemInput, asDraft = false) {
@@ -109,23 +103,26 @@ export async function createCalendarItem(input: CalendarItemInput, asDraft = fal
     throw new Error("Choose a date before scheduling this item.");
   }
 
-  const [item] = await db
-    .insert(calendarItems)
-    .values({
-      userId,
+  const { data, error } = await supabase
+    .from("calendar_items")
+    .insert({
+      user_id: userId,
       title,
       description: cleanOptionalText(input.description),
-      itemType: normalizeType(input.itemType),
+      item_type: normalizeType(input.itemType),
       category: normalizeCategory(input.category),
-      scheduledDate,
-      scheduledTime: cleanOptionalText(input.scheduledTime),
-      isDraft: asDraft,
-      updatedAt: new Date(),
+      scheduled_date: scheduledDate,
+      scheduled_time: cleanOptionalText(input.scheduledTime),
+      is_draft: asDraft,
+      updated_at: new Date().toISOString(),
     })
-    .returning();
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/calendar");
-  return toDTO(item);
+  return toDTO(data);
 }
 
 export async function updateCalendarItem(id: number, input: CalendarItemInput, asDraft = false) {
@@ -142,27 +139,29 @@ export async function updateCalendarItem(id: number, input: CalendarItemInput, a
     throw new Error("Choose a date before scheduling this item.");
   }
 
-  const [item] = await db
-    .update(calendarItems)
-    .set({
+  const { data, error } = await supabase
+    .from("calendar_items")
+    .update({
       title,
       description: cleanOptionalText(input.description),
-      itemType: normalizeType(input.itemType),
+      item_type: normalizeType(input.itemType),
       category: normalizeCategory(input.category),
-      scheduledDate,
-      scheduledTime: cleanOptionalText(input.scheduledTime),
-      isDraft: asDraft,
-      updatedAt: new Date(),
+      scheduled_date: scheduledDate,
+      scheduled_time: cleanOptionalText(input.scheduledTime),
+      is_draft: asDraft,
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(calendarItems.id, id), eq(calendarItems.userId, userId)))
-    .returning();
+    .eq("id", id)
+    .eq("user_id", userId)
+    .select()
+    .single();
 
-  if (!item) {
+  if (error || !data) {
     throw new Error("Calendar item not found.");
   }
 
   revalidatePath("/calendar");
-  return toDTO(item);
+  return toDTO(data);
 }
 
 export async function scheduleCalendarItem(id: number, scheduledDate: string) {
@@ -173,57 +172,64 @@ export async function scheduleCalendarItem(id: number, scheduledDate: string) {
     throw new Error("Choose a date before scheduling this item.");
   }
 
-  const [item] = await db
-    .update(calendarItems)
-    .set({
-      scheduledDate: date,
-      isDraft: false,
-      updatedAt: new Date(),
+  const { data, error } = await supabase
+    .from("calendar_items")
+    .update({
+      scheduled_date: date,
+      is_draft: false,
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(calendarItems.id, id), eq(calendarItems.userId, userId)))
-    .returning();
+    .eq("id", id)
+    .eq("user_id", userId)
+    .select()
+    .single();
 
-  if (!item) {
+  if (error || !data) {
     throw new Error("Calendar item not found.");
   }
 
   revalidatePath("/calendar");
-  return toDTO(item);
+  return toDTO(data);
 }
 
 export async function moveCalendarItemToDraft(id: number) {
   const userId = await getCurrentDatabaseUserId();
 
-  const [item] = await db
-    .update(calendarItems)
-    .set({
-      scheduledDate: null,
-      isDraft: true,
-      updatedAt: new Date(),
+  const { data, error } = await supabase
+    .from("calendar_items")
+    .update({
+      scheduled_date: null,
+      is_draft: true,
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(calendarItems.id, id), eq(calendarItems.userId, userId)))
-    .returning();
+    .eq("id", id)
+    .eq("user_id", userId)
+    .select()
+    .single();
 
-  if (!item) {
+  if (error || !data) {
     throw new Error("Calendar item not found.");
   }
 
   revalidatePath("/calendar");
-  return toDTO(item);
+  return toDTO(data);
 }
 
 export async function deleteCalendarItem(id: number) {
   const userId = await getCurrentDatabaseUserId();
 
-  const [item] = await db
-    .delete(calendarItems)
-    .where(and(eq(calendarItems.id, id), eq(calendarItems.userId, userId)))
-    .returning({ id: calendarItems.id });
+  const { data, error } = await supabase
+    .from("calendar_items")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", userId)
+    .select("id")
+    .single();
 
-  if (!item) {
+  if (error || !data) {
     throw new Error("Calendar item not found.");
   }
 
   revalidatePath("/calendar");
-  return item.id;
+  return data.id;
 }

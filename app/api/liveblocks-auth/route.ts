@@ -1,7 +1,6 @@
 import { currentUser } from "@clerk/nextjs/server";
-import { and, eq } from "drizzle-orm";
 
-import { db, kanbanBoardShares, kanbanBoards, users } from "@/db";
+import { supabase } from "@/db";
 import {
   createLiveblocksClient,
   getAvatarColor,
@@ -35,28 +34,41 @@ export async function POST(request: Request) {
   const liveblocksId = getLiveblocksUserId(normalizedEmail);
   const name = clerkUser.fullName || clerkUser.username || normalizedEmail.split("@")[0] || null;
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email: normalizedEmail, liveblocksId, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email: normalizedEmail, liveblocksId, name },
-    })
-    .returning({ id: users.id });
+  const { data: databaseUser, error } = await supabase
+    .from("users")
+    .upsert(
+      { clerk_id: clerkId, email: normalizedEmail, liveblocks_id: liveblocksId, name },
+      { onConflict: "clerk_id" },
+    )
+    .select("id")
+    .single();
 
-  await db
-    .update(kanbanBoardShares)
-    .set({ acceptedUserId: databaseUser.id, updatedAt: new Date() })
-    .where(and(eq(kanbanBoardShares.email, normalizedEmail), eq(kanbanBoardShares.role, "editor")));
+  if (error) {
+    return new Response("Database error.", { status: 500 });
+  }
 
-  const ownedBoard = await db.query.kanbanBoards.findFirst({
-    where: and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, databaseUser.id)),
-  });
-  const sharedBoard = ownedBoard
-    ? null
-    : await db.query.kanbanBoardShares.findFirst({
-        where: and(eq(kanbanBoardShares.boardId, boardId), eq(kanbanBoardShares.email, normalizedEmail), eq(kanbanBoardShares.role, "editor")),
-      });
+  await supabase
+    .from("kanban_board_shares")
+    .update({ accepted_user_id: databaseUser.id, updated_at: new Date().toISOString() })
+    .eq("email", normalizedEmail)
+    .eq("role", "editor");
+
+  const { data: ownedBoard } = await supabase
+    .from("kanban_boards")
+    .select("id")
+    .eq("id", boardId)
+    .eq("user_id", databaseUser.id)
+    .maybeSingle();
+
+  const { data: sharedBoard } = ownedBoard
+    ? { data: null }
+    : await supabase
+        .from("kanban_board_shares")
+        .select("id")
+        .eq("board_id", boardId)
+        .eq("email", normalizedEmail)
+        .eq("role", "editor")
+        .maybeSingle();
 
   if (!ownedBoard && !sharedBoard) {
     return new Response("Forbidden", { status: 403 });

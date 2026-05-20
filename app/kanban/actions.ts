@@ -1,10 +1,9 @@
 "use server";
 
 import { currentUser } from "@clerk/nextjs/server";
-import { and, asc, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { calendarItems, db, kanbanBoardShares, kanbanBoards, kanbanColumns, kanbanTasks, users } from "@/db";
+import { supabase } from "@/db";
 import { assertFreePlanLimit } from "@/lib/user-preferences";
 import {
   createLiveblocksClient,
@@ -158,22 +157,22 @@ function toCollaboratorDTO(input: {
   };
 }
 
-function toTaskDTO(task: typeof kanbanTasks.$inferSelect): KanbanTaskDTO {
+function toTaskDTO(task: any): KanbanTaskDTO {
   return {
     id: task.id,
-    columnId: task.columnId,
+    columnId: task.column_id,
     title: task.title,
     description: task.description,
-    dueDate: task.dueDate,
+    dueDate: task.due_date,
     priority: normalizePriority(task.priority),
     category: normalizeCategory(task.category),
-    labels: normalizeLabels(task.labels),
-    syncCalendar: task.syncCalendar,
-    linkNotes: task.linkNotes,
-    calendarItemId: task.calendarItemId,
+    labels: normalizeLabels(task.labels ?? []),
+    syncCalendar: task.sync_calendar,
+    linkNotes: task.link_notes,
+    calendarItemId: task.calendar_item_id,
     position: task.position,
-    createdAt: task.createdAt.toISOString(),
-    updatedAt: task.updatedAt.toISOString(),
+    createdAt: task.created_at,
+    updatedAt: task.updated_at,
   };
 }
 
@@ -190,33 +189,38 @@ async function getCurrentDatabaseUser() {
   const liveblocksId = getLiveblocksUserId(normalizedEmail);
   const name = user.fullName || user.username || normalizedEmail.split("@")[0] || null;
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email: normalizedEmail, liveblocksId, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email: normalizedEmail, liveblocksId, name },
-    })
-    .returning({ id: users.id, email: users.email, liveblocksId: users.liveblocksId, name: users.name });
+  const { data: databaseUser, error } = await supabase
+    .from("users")
+    .upsert(
+      { clerk_id: clerkId, email: normalizedEmail, liveblocks_id: liveblocksId, name },
+      { onConflict: "clerk_id" },
+    )
+    .select("id, email, liveblocks_id, name")
+    .single();
 
-  await db
-    .update(kanbanBoardShares)
-    .set({ acceptedUserId: databaseUser.id, updatedAt: new Date() })
-    .where(and(eq(kanbanBoardShares.email, normalizedEmail), eq(kanbanBoardShares.role, "editor")));
+  if (error) throw new Error(error.message);
+
+  await supabase
+    .from("kanban_board_shares")
+    .update({ accepted_user_id: databaseUser.id, updated_at: new Date().toISOString() })
+    .eq("email", normalizedEmail)
+    .eq("role", "editor");
 
   return {
-    ...databaseUser,
+    id: databaseUser.id,
     email: normalizedEmail,
     liveblocksId,
+    name: databaseUser.name,
   };
 }
 
 async function assertBoardOwner(boardId: number, userId: number) {
-  const [board] = await db
-    .select()
-    .from(kanbanBoards)
-    .where(and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, userId)))
-    .limit(1);
+  const { data: board } = await supabase
+    .from("kanban_boards")
+    .select("*")
+    .eq("id", boardId)
+    .eq("user_id", userId)
+    .maybeSingle();
 
   if (!board) {
     throw new Error("Kanban board not found.");
@@ -226,72 +230,74 @@ async function assertBoardOwner(boardId: number, userId: number) {
 }
 
 async function assertBoardAccess(boardId: number, user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const [ownedBoard] = await db
-    .select()
-    .from(kanbanBoards)
-    .where(and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, user.id)))
-    .limit(1);
+  const { data: ownedBoard } = await supabase
+    .from("kanban_boards")
+    .select("*")
+    .eq("id", boardId)
+    .eq("user_id", user.id)
+    .maybeSingle();
 
   if (ownedBoard) {
     return { board: ownedBoard, canManage: true };
   }
 
-  const [sharedBoard] = await db
-    .select({ board: kanbanBoards })
-    .from(kanbanBoardShares)
-    .innerJoin(kanbanBoards, eq(kanbanBoardShares.boardId, kanbanBoards.id))
-    .where(and(eq(kanbanBoardShares.boardId, boardId), eq(kanbanBoardShares.email, user.email), eq(kanbanBoardShares.role, "editor")))
-    .limit(1);
+  const { data: shareRow } = await supabase
+    .from("kanban_board_shares")
+    .select("*, kanban_boards!inner(*)")
+    .eq("board_id", boardId)
+    .eq("email", user.email)
+    .eq("role", "editor")
+    .maybeSingle();
 
-  if (!sharedBoard) {
+  if (!shareRow) {
     throw new Error("Kanban board not found.");
   }
 
-  return { board: sharedBoard.board, canManage: false };
+  return { board: (shareRow as any).kanban_boards, canManage: false };
 }
 
 async function assertColumnAccess(columnId: number, user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const [record] = await db
-    .select({ column: kanbanColumns, board: kanbanBoards })
-    .from(kanbanColumns)
-    .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(eq(kanbanColumns.id, columnId))
-    .limit(1);
+  const { data: record } = await supabase
+    .from("kanban_columns")
+    .select("*, kanban_boards!inner(*)")
+    .eq("id", columnId)
+    .maybeSingle();
 
   if (!record) {
     throw new Error("Kanban column not found.");
   }
 
-  await assertBoardAccess(record.board.id, user);
-  return record;
+  const board = (record as any).kanban_boards;
+  await assertBoardAccess(board.id, user);
+  return { column: record, board };
 }
 
 async function assertTaskAccess(taskId: number, user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const [record] = await db
-    .select({ task: kanbanTasks, column: kanbanColumns, board: kanbanBoards })
-    .from(kanbanTasks)
-    .innerJoin(kanbanColumns, eq(kanbanTasks.columnId, kanbanColumns.id))
-    .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(eq(kanbanTasks.id, taskId))
-    .limit(1);
+  const { data: record } = await supabase
+    .from("kanban_tasks")
+    .select("*, kanban_columns!inner(*, kanban_boards!inner(*))")
+    .eq("id", taskId)
+    .maybeSingle();
 
   if (!record) {
     throw new Error("Kanban task not found.");
   }
 
-  await assertBoardAccess(record.board.id, user);
-  return record;
+  const column = (record as any).kanban_columns;
+  const board = column.kanban_boards;
+  await assertBoardAccess(board.id, user);
+  return { task: record, column, board };
 }
 
 async function upsertLiveblocksRoom(boardId: number) {
-  const board = await db.query.kanbanBoards.findFirst({ where: eq(kanbanBoards.id, boardId) });
+  const { data: board } = await supabase.from("kanban_boards").select("*").eq("id", boardId).maybeSingle();
   if (!board) return;
 
-  const owner = await db.query.users.findFirst({ where: eq(users.id, board.userId) });
+  const { data: owner } = await supabase.from("users").select("*").eq("id", board.user_id).maybeSingle();
   if (!owner) return;
 
-  const shares = await db.query.kanbanBoardShares.findMany({ where: eq(kanbanBoardShares.boardId, boardId) });
-  const usersAccesses = [owner.email, ...shares.map((share) => share.email)].reduce<Record<string, ["room:write"]>>((accesses, email) => {
+  const { data: shares } = await supabase.from("kanban_board_shares").select("*").eq("board_id", boardId);
+  const usersAccesses = [owner.email, ...(shares ?? []).map((share: any) => share.email)].reduce<Record<string, ["room:write"]>>((accesses, email) => {
     accesses[getLiveblocksUserId(email)] = ["room:write"];
     return accesses;
   }, {});
@@ -311,21 +317,19 @@ async function upsertLiveblocksRoom(boardId: number) {
 }
 
 async function nextColumnPosition(boardId: number) {
-  const columns = await db.query.kanbanColumns.findMany({
-    where: eq(kanbanColumns.boardId, boardId),
-    orderBy: [asc(kanbanColumns.position), asc(kanbanColumns.id)],
-  });
-
-  return columns.length;
+  const { data: columns } = await supabase
+    .from("kanban_columns")
+    .select("id")
+    .eq("board_id", boardId);
+  return (columns ?? []).length;
 }
 
 async function nextTaskPosition(columnId: number) {
-  const tasks = await db.query.kanbanTasks.findMany({
-    where: eq(kanbanTasks.columnId, columnId),
-    orderBy: [asc(kanbanTasks.position), asc(kanbanTasks.id)],
-  });
-
-  return tasks.length;
+  const { data: tasks } = await supabase
+    .from("kanban_tasks")
+    .select("id")
+    .eq("column_id", columnId);
+  return (tasks ?? []).length;
 }
 
 async function syncCalendarItem(userId: number, input: {
@@ -337,120 +341,135 @@ async function syncCalendarItem(userId: number, input: {
 }) {
   if (!input.syncCalendar) {
     if (input.calendarItemId) {
-      await db.delete(calendarItems).where(and(eq(calendarItems.id, input.calendarItemId), eq(calendarItems.userId, userId)));
+      await supabase
+        .from("calendar_items")
+        .delete()
+        .eq("id", input.calendarItemId)
+        .eq("user_id", userId);
     }
     return null;
   }
 
+  const itemValues = {
+    title: input.title,
+    description: cleanOptionalText(input.description),
+    item_type: "task",
+    category: "work",
+    scheduled_date: input.dueDate,
+    scheduled_time: null,
+    is_draft: false,
+    updated_at: new Date().toISOString(),
+  };
+
   if (input.calendarItemId) {
-    const [item] = await db
-      .update(calendarItems)
-      .set({
-        title: input.title,
-        description: cleanOptionalText(input.description),
-        itemType: "task",
-        category: "work",
-        scheduledDate: input.dueDate,
-        scheduledTime: null,
-        isDraft: false,
-        updatedAt: new Date(),
-      })
-      .where(and(eq(calendarItems.id, input.calendarItemId), eq(calendarItems.userId, userId)))
-      .returning({ id: calendarItems.id });
+    const { data: item } = await supabase
+      .from("calendar_items")
+      .update(itemValues)
+      .eq("id", input.calendarItemId)
+      .eq("user_id", userId)
+      .select("id")
+      .maybeSingle();
 
     if (item) return item.id;
   }
 
-  const [item] = await db
-    .insert(calendarItems)
-    .values({
-      userId,
-      title: input.title,
-      description: cleanOptionalText(input.description),
-      itemType: "task",
-      category: "work",
-      scheduledDate: input.dueDate,
-      scheduledTime: null,
-      isDraft: false,
-      updatedAt: new Date(),
-    })
-    .returning({ id: calendarItems.id });
+  const { data: item } = await supabase
+    .from("calendar_items")
+    .insert({ user_id: userId, ...itemValues })
+    .select("id")
+    .single();
 
-  return item.id;
+  return item?.id ?? null;
 }
 
 async function deleteLinkedCalendarItems(calendarItemIds: number[], userId: number) {
   if (calendarItemIds.length === 0) return;
 
-  await db.delete(calendarItems).where(and(inArray(calendarItems.id, calendarItemIds), eq(calendarItems.userId, userId)));
+  await supabase
+    .from("calendar_items")
+    .delete()
+    .in("id", calendarItemIds)
+    .eq("user_id", userId);
 }
 
 export async function listKanbanBoards() {
   const user = await getCurrentDatabaseUser();
-  const ownedBoards = await db.query.kanbanBoards.findMany({
-    where: eq(kanbanBoards.userId, user.id),
-    orderBy: [asc(kanbanBoards.createdAt), asc(kanbanBoards.id)],
+
+  const { data: ownedBoards } = await supabase
+    .from("kanban_boards")
+    .select("*")
+    .eq("user_id", user.id)
+    .order("created_at")
+    .order("id");
+
+  const { data: sharedRows } = await supabase
+    .from("kanban_board_shares")
+    .select("*, kanban_boards!inner(*)")
+    .eq("email", user.email)
+    .eq("role", "editor");
+
+  const boardsById = new Map(
+    [...(ownedBoards ?? []), ...(sharedRows ?? []).map((row: any) => row.kanban_boards)].map((board) => [board.id, board]),
+  );
+  const boards = Array.from(boardsById.values()).sort((left, right) => {
+    const leftTime = new Date(left.created_at).getTime();
+    const rightTime = new Date(right.created_at).getTime();
+    return leftTime - rightTime || left.id - right.id;
   });
-  const sharedRows = await db
-    .select({ board: kanbanBoards })
-    .from(kanbanBoardShares)
-    .innerJoin(kanbanBoards, eq(kanbanBoardShares.boardId, kanbanBoards.id))
-    .where(and(eq(kanbanBoardShares.email, user.email), eq(kanbanBoardShares.role, "editor")))
-    .orderBy(asc(kanbanBoards.createdAt), asc(kanbanBoards.id));
-  const boardsById = new Map([...ownedBoards, ...sharedRows.map((row) => row.board)].map((board) => [board.id, board]));
-  const boards = Array.from(boardsById.values()).sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id - right.id);
 
   if (boards.length === 0) return [];
 
   const boardIds = boards.map((board) => board.id);
-  const ownerIds = Array.from(new Set(boards.map((board) => board.userId)));
-  const owners = await db.query.users.findMany({ where: inArray(users.id, ownerIds) });
-  const ownerById = new Map(owners.map((owner) => [owner.id, owner]));
-  const shares = await db.query.kanbanBoardShares.findMany({
-    where: inArray(kanbanBoardShares.boardId, boardIds),
-    orderBy: [asc(kanbanBoardShares.createdAt), asc(kanbanBoardShares.id)],
-  });
-  const acceptedUserIds = shares.map((share) => share.acceptedUserId).filter((id): id is number => Boolean(id));
-  const acceptedUsers =
-    acceptedUserIds.length > 0 ? await db.query.users.findMany({ where: inArray(users.id, acceptedUserIds) }) : [];
-  const acceptedUserById = new Map(acceptedUsers.map((acceptedUser) => [acceptedUser.id, acceptedUser]));
-  const sharesByBoard = shares.reduce<Record<number, KanbanCollaboratorDTO[]>>((grouped, share) => {
-    const acceptedUser = share.acceptedUserId ? acceptedUserById.get(share.acceptedUserId) : null;
-    grouped[share.boardId] = [
-      ...(grouped[share.boardId] || []),
+  const ownerIds = Array.from(new Set(boards.map((board) => board.user_id)));
+
+  const [
+    { data: owners },
+    { data: shares },
+    { data: columns },
+  ] = await Promise.all([
+    supabase.from("users").select("*").in("id", ownerIds),
+    supabase.from("kanban_board_shares").select("*").in("board_id", boardIds).order("created_at").order("id"),
+    supabase.from("kanban_columns").select("*").in("board_id", boardIds).order("position").order("id"),
+  ]);
+
+  const ownerById = new Map((owners ?? []).map((owner: any) => [owner.id, owner]));
+  const acceptedUserIds = (shares ?? []).map((share: any) => share.accepted_user_id).filter(Boolean);
+  const { data: acceptedUsers } = acceptedUserIds.length > 0
+    ? await supabase.from("users").select("*").in("id", acceptedUserIds)
+    : { data: [] };
+  const acceptedUserById = new Map((acceptedUsers ?? []).map((u: any) => [u.id, u]));
+
+  const sharesByBoard = (shares ?? []).reduce<Record<number, KanbanCollaboratorDTO[]>>((grouped, share: any) => {
+    const acceptedUser = share.accepted_user_id ? acceptedUserById.get(share.accepted_user_id) : null;
+    grouped[share.board_id] = [
+      ...(grouped[share.board_id] || []),
       toCollaboratorDTO({
-        id: acceptedUser?.id ?? null,
-        name: acceptedUser?.name ?? null,
+        id: (acceptedUser as any)?.id ?? null,
+        name: (acceptedUser as any)?.name ?? null,
         email: share.email,
-        liveblocksId: acceptedUser?.liveblocksId,
+        liveblocksId: (acceptedUser as any)?.liveblocks_id,
         role: "editor",
       }),
     ];
     return grouped;
   }, {});
-  const columns = await db.query.kanbanColumns.findMany({
-    where: inArray(kanbanColumns.boardId, boardIds),
-    orderBy: [asc(kanbanColumns.position), asc(kanbanColumns.id)],
-  });
-  const columnIds = columns.map((column) => column.id);
-  const tasks =
-    columnIds.length > 0
-      ? await db.query.kanbanTasks.findMany({
-          where: inArray(kanbanTasks.columnId, columnIds),
-          orderBy: [asc(kanbanTasks.position), asc(kanbanTasks.id)],
-        })
-      : [];
 
-  const tasksByColumn = tasks.reduce<Record<number, KanbanTaskDTO[]>>((grouped, task) => {
-    grouped[task.columnId] = [...(grouped[task.columnId] || []), toTaskDTO(task)];
+  const columnIds = (columns ?? []).map((column: any) => column.id);
+  const { data: tasks } = columnIds.length > 0
+    ? await supabase.from("kanban_tasks").select("*").in("column_id", columnIds).order("position").order("id")
+    : { data: [] };
+
+  const tasksByColumn = (tasks ?? []).reduce<Record<number, KanbanTaskDTO[]>>((grouped, task: any) => {
+    grouped[task.column_id] = [...(grouped[task.column_id] || []), toTaskDTO(task)];
     return grouped;
   }, {});
-  const columnsByBoard = columns.reduce<Record<number, KanbanColumnDTO[]>>((grouped, column) => {
-    grouped[column.boardId] = [
-      ...(grouped[column.boardId] || []),
+
+  const columnsByBoard = (columns ?? []).reduce<Record<number, KanbanColumnDTO[]>>((grouped, column: any) => {
+    grouped[column.board_id] = [
+      ...(grouped[column.board_id] || []),
       {
         id: column.id,
-        boardId: column.boardId,
+        boardId: column.board_id,
         name: column.name,
         position: column.position,
         tasks: tasksByColumn[column.id] || [],
@@ -464,16 +483,16 @@ export async function listKanbanBoards() {
     name: board.name,
     color: normalizeBoardColor(board.color),
     owner: toCollaboratorDTO({
-      id: board.userId,
-      name: ownerById.get(board.userId)?.name ?? null,
-      email: ownerById.get(board.userId)?.email ?? user.email,
-      liveblocksId: ownerById.get(board.userId)?.liveblocksId,
+      id: board.user_id,
+      name: (ownerById.get(board.user_id) as any)?.name ?? null,
+      email: (ownerById.get(board.user_id) as any)?.email ?? user.email,
+      liveblocksId: (ownerById.get(board.user_id) as any)?.liveblocks_id,
       role: "owner",
     }),
     shares: sharesByBoard[board.id] || [],
-    canManage: board.userId === user.id,
-    createdAt: board.createdAt.toISOString(),
-    updatedAt: board.updatedAt.toISOString(),
+    canManage: board.user_id === user.id,
+    createdAt: board.created_at,
+    updatedAt: board.updated_at,
     columns: columnsByBoard[board.id] || [],
   }));
 }
@@ -487,12 +506,18 @@ export async function createKanbanBoard(input: BoardInput) {
     throw new Error("Board name is required.");
   }
 
-  const [board] = await db
-    .insert(kanbanBoards)
-    .values({ userId: user.id, name, color: normalizeBoardColor(input.color), updatedAt: new Date() })
-    .returning();
+  const { data: board, error } = await supabase
+    .from("kanban_boards")
+    .insert({ user_id: user.id, name, color: normalizeBoardColor(input.color), updated_at: new Date().toISOString() })
+    .select()
+    .single();
 
-  await db.insert(kanbanColumns).values(defaultColumns.map((columnName, index) => ({ boardId: board.id, name: columnName, position: index })));
+  if (error) throw new Error(error.message);
+
+  await supabase
+    .from("kanban_columns")
+    .insert(defaultColumns.map((columnName, index) => ({ board_id: board.id, name: columnName, position: index })));
+
   await upsertLiveblocksRoom(board.id);
 
   revalidatePath("/kanban");
@@ -508,10 +533,11 @@ export async function updateKanbanBoard(boardId: number, input: BoardInput) {
     throw new Error("Board name is required.");
   }
 
-  await db
-    .update(kanbanBoards)
-    .set({ name, color: normalizeBoardColor(input.color), updatedAt: new Date() })
-    .where(and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, user.id)));
+  await supabase
+    .from("kanban_boards")
+    .update({ name, color: normalizeBoardColor(input.color), updated_at: new Date().toISOString() })
+    .eq("id", boardId)
+    .eq("user_id", user.id);
 
   revalidatePath("/kanban");
   return listKanbanBoards();
@@ -520,17 +546,18 @@ export async function updateKanbanBoard(boardId: number, input: BoardInput) {
 export async function deleteKanbanBoard(boardId: number) {
   const user = await getCurrentDatabaseUser();
   await assertBoardOwner(boardId, user.id);
-  const columns = await db.query.kanbanColumns.findMany({ where: eq(kanbanColumns.boardId, boardId) });
-  const columnIds = columns.map((column) => column.id);
-  const tasks =
-    columnIds.length > 0
-      ? await db.query.kanbanTasks.findMany({
-          where: inArray(kanbanTasks.columnId, columnIds),
-        })
-      : [];
 
-  await deleteLinkedCalendarItems(tasks.map((task) => task.calendarItemId).filter((id): id is number => Boolean(id)), user.id);
-  await db.delete(kanbanBoards).where(and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, user.id)));
+  const { data: columns } = await supabase.from("kanban_columns").select("id").eq("board_id", boardId);
+  const columnIds = (columns ?? []).map((c: any) => c.id);
+
+  const { data: tasks } = columnIds.length > 0
+    ? await supabase.from("kanban_tasks").select("calendar_item_id").in("column_id", columnIds)
+    : { data: [] };
+
+  const calendarItemIds = (tasks ?? []).map((t: any) => t.calendar_item_id).filter(Boolean);
+  await deleteLinkedCalendarItems(calendarItemIds, user.id);
+
+  await supabase.from("kanban_boards").delete().eq("id", boardId).eq("user_id", user.id);
 
   revalidatePath("/kanban");
   revalidatePath("/calendar");
@@ -550,27 +577,21 @@ export async function inviteKanbanCollaborator(input: InviteInput) {
     throw new Error("You already own this board.");
   }
 
-  const acceptedUser = await db.query.users.findFirst({ where: eq(users.email, email) });
+  const { data: acceptedUser } = await supabase.from("users").select("id").eq("email", email).maybeSingle();
 
-  await db
-    .insert(kanbanBoardShares)
-    .values({
-      boardId: board.id,
-      email,
-      role: "editor",
-      invitedByUserId: user.id,
-      acceptedUserId: acceptedUser?.id ?? null,
-      updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: [kanbanBoardShares.boardId, kanbanBoardShares.email],
-      set: {
+  await supabase
+    .from("kanban_board_shares")
+    .upsert(
+      {
+        board_id: board.id,
+        email,
         role: "editor",
-        invitedByUserId: user.id,
-        acceptedUserId: acceptedUser?.id ?? null,
-        updatedAt: new Date(),
+        invited_by_user_id: user.id,
+        accepted_user_id: (acceptedUser as any)?.id ?? null,
+        updated_at: new Date().toISOString(),
       },
-    });
+      { onConflict: "board_id,email" },
+    );
 
   await upsertLiveblocksRoom(board.id);
   revalidatePath("/kanban");
@@ -592,8 +613,8 @@ export async function createKanbanColumn(input: ColumnInput) {
     throw new Error("Each board can have up to 5 columns.");
   }
 
-  await db.insert(kanbanColumns).values({ boardId: input.boardId, name, position, updatedAt: new Date() });
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, input.boardId));
+  await supabase.from("kanban_columns").insert({ board_id: input.boardId, name, position, updated_at: new Date().toISOString() });
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", input.boardId);
 
   revalidatePath("/kanban");
   return listKanbanBoards();
@@ -608,8 +629,8 @@ export async function updateKanbanColumn(columnId: number, name: string) {
     throw new Error("Column name is required.");
   }
 
-  await db.update(kanbanColumns).set({ name: nextName, updatedAt: new Date() }).where(eq(kanbanColumns.id, columnId));
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, column.boardId));
+  await supabase.from("kanban_columns").update({ name: nextName, updated_at: new Date().toISOString() }).eq("id", columnId);
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", (column as any).board_id);
 
   revalidatePath("/kanban");
   return listKanbanBoards();
@@ -618,11 +639,13 @@ export async function updateKanbanColumn(columnId: number, name: string) {
 export async function deleteKanbanColumn(columnId: number) {
   const user = await getCurrentDatabaseUser();
   const { column } = await assertColumnAccess(columnId, user);
-  const tasks = await db.query.kanbanTasks.findMany({ where: eq(kanbanTasks.columnId, columnId) });
 
-  await deleteLinkedCalendarItems(tasks.map((task) => task.calendarItemId).filter((id): id is number => Boolean(id)), user.id);
-  await db.delete(kanbanColumns).where(eq(kanbanColumns.id, columnId));
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, column.boardId));
+  const { data: tasks } = await supabase.from("kanban_tasks").select("calendar_item_id").eq("column_id", columnId);
+  const calendarItemIds = (tasks ?? []).map((t: any) => t.calendar_item_id).filter(Boolean);
+
+  await deleteLinkedCalendarItems(calendarItemIds, user.id);
+  await supabase.from("kanban_columns").delete().eq("id", columnId);
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", (column as any).board_id);
 
   revalidatePath("/kanban");
   revalidatePath("/calendar");
@@ -647,21 +670,22 @@ export async function createKanbanTask(input: TaskInput) {
     syncCalendar: input.syncCalendar,
   });
 
-  await db.insert(kanbanTasks).values({
-    columnId: column.id,
+  await supabase.from("kanban_tasks").insert({
+    column_id: (column as any).id,
     title,
     description: cleanOptionalText(input.description),
-    dueDate,
+    due_date: dueDate,
     priority: normalizePriority(input.priority),
     category: normalizeCategory(input.category),
     labels: normalizeLabels(input.labels),
-    syncCalendar: input.syncCalendar,
-    linkNotes: input.linkNotes,
-    calendarItemId,
-    position: await nextTaskPosition(column.id),
-    updatedAt: new Date(),
+    sync_calendar: input.syncCalendar,
+    link_notes: input.linkNotes,
+    calendar_item_id: calendarItemId,
+    position: await nextTaskPosition((column as any).id),
+    updated_at: new Date().toISOString(),
   });
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, board.id));
+
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", (board as any).id);
 
   revalidatePath("/kanban");
   revalidatePath("/calendar");
@@ -684,26 +708,27 @@ export async function updateKanbanTask(taskId: number, input: TaskInput) {
     description: input.description,
     dueDate,
     syncCalendar: input.syncCalendar,
-    calendarItemId: task.calendarItemId,
+    calendarItemId: (task as any).calendar_item_id,
   });
 
-  await db
-    .update(kanbanTasks)
-    .set({
-      columnId: column.id,
+  await supabase
+    .from("kanban_tasks")
+    .update({
+      column_id: (column as any).id,
       title,
       description: cleanOptionalText(input.description),
-      dueDate,
+      due_date: dueDate,
       priority: normalizePriority(input.priority),
       category: normalizeCategory(input.category),
       labels: normalizeLabels(input.labels),
-      syncCalendar: input.syncCalendar,
-      linkNotes: input.linkNotes,
-      calendarItemId,
-      updatedAt: new Date(),
+      sync_calendar: input.syncCalendar,
+      link_notes: input.linkNotes,
+      calendar_item_id: calendarItemId,
+      updated_at: new Date().toISOString(),
     })
-    .where(eq(kanbanTasks.id, taskId));
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, board.id));
+    .eq("id", taskId);
+
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", (board as any).id);
 
   revalidatePath("/kanban");
   revalidatePath("/calendar");
@@ -714,9 +739,9 @@ export async function deleteKanbanTask(taskId: number) {
   const user = await getCurrentDatabaseUser();
   const { task, board } = await assertTaskAccess(taskId, user);
 
-  await deleteLinkedCalendarItems(task.calendarItemId ? [task.calendarItemId] : [], user.id);
-  await db.delete(kanbanTasks).where(eq(kanbanTasks.id, taskId));
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, board.id));
+  await deleteLinkedCalendarItems((task as any).calendar_item_id ? [(task as any).calendar_item_id] : [], user.id);
+  await supabase.from("kanban_tasks").delete().eq("id", taskId);
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", (board as any).id);
 
   revalidatePath("/kanban");
   revalidatePath("/calendar");
@@ -727,21 +752,38 @@ export async function moveKanbanTask(taskId: number, targetColumnId: number, tar
   const user = await getCurrentDatabaseUser();
   const { task, board } = await assertTaskAccess(taskId, user);
   const { column } = await assertColumnAccess(targetColumnId, user);
-  const tasks = await db.query.kanbanTasks.findMany({
-    where: eq(kanbanTasks.columnId, column.id),
-    orderBy: [asc(kanbanTasks.position), asc(kanbanTasks.id)],
-  });
-  const withoutMoved = tasks.filter((nextTask) => nextTask.id !== taskId);
-  const boundedPosition = Math.max(0, Math.min(targetPosition, withoutMoved.length));
-  const reordered = [...withoutMoved.slice(0, boundedPosition), { ...task, columnId: column.id }, ...withoutMoved.slice(boundedPosition)];
 
-  await db.update(kanbanTasks).set({ columnId: column.id, position: boundedPosition, updatedAt: new Date() }).where(eq(kanbanTasks.id, taskId));
+  const { data: columnTasks } = await supabase
+    .from("kanban_tasks")
+    .select("*")
+    .eq("column_id", (column as any).id)
+    .order("position")
+    .order("id");
+
+  const tasks = columnTasks ?? [];
+  const withoutMoved = tasks.filter((nextTask: any) => nextTask.id !== taskId);
+  const boundedPosition = Math.max(0, Math.min(targetPosition, withoutMoved.length));
+  const reordered = [
+    ...withoutMoved.slice(0, boundedPosition),
+    { ...(task as any), column_id: (column as any).id },
+    ...withoutMoved.slice(boundedPosition),
+  ];
+
+  await supabase
+    .from("kanban_tasks")
+    .update({ column_id: (column as any).id, position: boundedPosition, updated_at: new Date().toISOString() })
+    .eq("id", taskId);
+
   await Promise.all(
-    reordered.map((nextTask, index) =>
-      db.update(kanbanTasks).set({ position: index, updatedAt: new Date() }).where(eq(kanbanTasks.id, nextTask.id)),
+    reordered.map((nextTask: any, index) =>
+      supabase
+        .from("kanban_tasks")
+        .update({ position: index, updated_at: new Date().toISOString() })
+        .eq("id", nextTask.id),
     ),
   );
-  await db.update(kanbanBoards).set({ updatedAt: new Date() }).where(eq(kanbanBoards.id, board.id));
+
+  await supabase.from("kanban_boards").update({ updated_at: new Date().toISOString() }).eq("id", (board as any).id);
 
   revalidatePath("/kanban");
   return listKanbanBoards();

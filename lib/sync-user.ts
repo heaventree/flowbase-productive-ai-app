@@ -2,7 +2,7 @@ import "server-only";
 
 import { currentUser } from "@clerk/nextjs/server";
 
-import { db, users } from "@/db";
+import { supabase } from "@/db";
 import { getLiveblocksUserId, normalizeCollaborationEmail } from "@/lib/liveblocks";
 
 export async function syncCurrentUserToDatabase() {
@@ -22,20 +22,15 @@ export async function syncCurrentUserToDatabase() {
     normalizedEmail.split("@")[0] ||
     null;
 
-  await db
-    .insert(users)
-    .values({
-      clerkId,
-      email: normalizedEmail,
-      liveblocksId: getLiveblocksUserId(normalizedEmail),
-      name,
-    })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: {
+  await supabase
+    .from("users")
+    .upsert(
+      {
+        clerk_id: clerkId,
         email: normalizedEmail,
-        liveblocksId: getLiveblocksUserId(normalizedEmail),
+        liveblocks_id: getLiveblocksUserId(normalizedEmail),
         name,
       },
-    });
+      { onConflict: "clerk_id" },
+    );
 }

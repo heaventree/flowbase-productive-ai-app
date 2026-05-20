@@ -1,23 +1,8 @@
 import "server-only";
 
 import { auth, currentUser } from "@clerk/nextjs/server";
-import { and, count, eq, inArray, sql } from "drizzle-orm";
 
-import {
-  calendarItems,
-  db,
-  generatedApps,
-  kanbanBoards,
-  kanbanColumns,
-  kanbanTasks,
-  notes,
-  spaces,
-  userAiUsage,
-  userCategories,
-  userSettings,
-  users,
-  whiteboards,
-} from "@/db";
+import { supabase } from "@/db";
 import { getLiveblocksUserId, normalizeCollaborationEmail } from "@/lib/liveblocks";
 
 export const categoryScopes = ["calendar", "task", "note", "reminder"] as const;
@@ -60,15 +45,15 @@ export function cleanIconName(value: string) {
   return icon || "Tag";
 }
 
-export function toCategoryDTO(category: typeof userCategories.$inferSelect): UserCategoryDTO {
+export function toCategoryDTO(category: any): UserCategoryDTO {
   return {
     id: category.id,
     scope: isCategoryScope(category.scope) ? category.scope : "calendar",
     name: category.name,
     color: cleanHexColor(category.color),
     icon: cleanIconName(category.icon),
-    createdAt: category.createdAt.toISOString(),
-    updatedAt: category.updatedAt.toISOString(),
+    createdAt: category.created_at,
+    updatedAt: category.updated_at,
   };
 }
 
@@ -85,16 +70,23 @@ export async function getCurrentDatabaseUser() {
   const name = user.fullName || user.username || normalizedEmail.split("@")[0] || null;
   const liveblocksId = getLiveblocksUserId(normalizedEmail);
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email: normalizedEmail, liveblocksId, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email: normalizedEmail, liveblocksId, name },
-    })
-    .returning({ id: users.id, email: users.email, name: users.name, clerkId: users.clerkId });
+  const { data, error } = await supabase
+    .from("users")
+    .upsert(
+      { clerk_id: clerkId, email: normalizedEmail, liveblocks_id: liveblocksId, name },
+      { onConflict: "clerk_id" },
+    )
+    .select("id, email, name, clerk_id")
+    .single();
 
-  return databaseUser;
+  if (error) throw new Error(error.message);
+
+  return {
+    id: data.id,
+    email: data.email,
+    name: data.name,
+    clerkId: data.clerk_id,
+  };
 }
 
 export async function isCurrentUserPro() {
@@ -106,36 +98,51 @@ export async function isCurrentUserPro() {
 
 export async function listUserCategories(scopes: CategoryScope[] = [...categoryScopes]) {
   const user = await getCurrentDatabaseUser();
-  const rows = await db.query.userCategories.findMany({
-    where: and(eq(userCategories.userId, user.id), inArray(userCategories.scope, scopes)),
-  });
+  const { data: rows } = await supabase
+    .from("user_categories")
+    .select("*")
+    .eq("user_id", user.id)
+    .in("scope", scopes);
 
-  return rows.map(toCategoryDTO).sort((left, right) => left.scope.localeCompare(right.scope) || left.name.localeCompare(right.name));
+  return (rows ?? [])
+    .map(toCategoryDTO)
+    .sort((left, right) => left.scope.localeCompare(right.scope) || left.name.localeCompare(right.name));
 }
 
 export async function getUserUsageSnapshot(userId: number) {
   const today = new Date().toISOString().slice(0, 10);
-  const [boardCount] = await db.select({ value: count() }).from(kanbanBoards).where(eq(kanbanBoards.userId, userId));
-  const [taskCount] = await db
-    .select({ value: count() })
-    .from(kanbanTasks)
-    .innerJoin(kanbanColumns, eq(kanbanTasks.columnId, kanbanColumns.id))
-    .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(eq(kanbanBoards.userId, userId));
-  const [noteCount] = await db.select({ value: count() }).from(notes).where(eq(notes.userId, userId));
-  const [spaceCount] = await db.select({ value: count() }).from(spaces).where(eq(spaces.userId, userId));
-  const [whiteboardCount] = await db.select({ value: count() }).from(whiteboards).where(eq(whiteboards.userId, userId));
-  const usage = await db.query.userAiUsage.findFirst({
-    where: and(eq(userAiUsage.userId, userId), eq(userAiUsage.usageDate, today)),
-  });
+
+  const [
+    { count: boardCount },
+    { data: taskCountData },
+    { count: noteCount },
+    { count: spaceCount },
+    { count: whiteboardCount },
+    { data: usageData },
+  ] = await Promise.all([
+    supabase.from("kanban_boards").select("*", { count: "exact", head: true }).eq("user_id", userId),
+    supabase
+      .from("kanban_tasks")
+      .select("kanban_columns!inner(kanban_boards!inner(user_id))")
+      .eq("kanban_columns.kanban_boards.user_id", userId),
+    supabase.from("notes").select("*", { count: "exact", head: true }).eq("user_id", userId),
+    supabase.from("spaces").select("*", { count: "exact", head: true }).eq("user_id", userId),
+    supabase.from("whiteboards").select("*", { count: "exact", head: true }).eq("user_id", userId),
+    supabase
+      .from("user_ai_usage")
+      .select("action_count")
+      .eq("user_id", userId)
+      .eq("usage_date", today)
+      .maybeSingle(),
+  ]);
 
   return {
-    boards: boardCount?.value ?? 0,
-    tasks: taskCount?.value ?? 0,
-    notes: noteCount?.value ?? 0,
-    spaces: spaceCount?.value ?? 0,
-    whiteboards: whiteboardCount?.value ?? 0,
-    aiActionsToday: usage?.actionCount ?? 0,
+    boards: boardCount ?? 0,
+    tasks: taskCountData?.length ?? 0,
+    notes: noteCount ?? 0,
+    spaces: spaceCount ?? 0,
+    whiteboards: whiteboardCount ?? 0,
+    aiActionsToday: (usageData as any)?.action_count ?? 0,
     aiUsageDate: today,
   };
 }
@@ -153,10 +160,21 @@ export async function assertFreePlanLimit(kind: keyof Omit<typeof freePlanLimits
   }
 }
 
-export async function assertAiFeatureEnabled(feature: "aiRefineEnabled" | "aiTemplateBuilderEnabled" | "aiDiagramEnabled") {
+export async function assertAiFeatureEnabled(feature: "aiRefineEnabled" | "aiTemplateBuilderEnabled" | "aiDiagramEnabled" | "aiAssistantEnabled") {
   const user = await getCurrentDatabaseUser();
-  const settings = await db.query.userSettings.findFirst({ where: eq(userSettings.userId, user.id) });
-  if (settings && !settings[feature]) {
+  const featureMap: Record<string, string> = {
+    aiRefineEnabled: "ai_refine_enabled",
+    aiTemplateBuilderEnabled: "ai_template_builder_enabled",
+    aiDiagramEnabled: "ai_diagram_enabled",
+    aiAssistantEnabled: "ai_assistant_enabled",
+  };
+  const { data: settings } = await supabase
+    .from("user_settings")
+    .select("*")
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (settings && !settings[featureMap[feature]]) {
     throw new Error("This AI feature is disabled in Settings.");
   }
 }
@@ -166,34 +184,49 @@ export async function recordAiAction() {
 
   const user = await getCurrentDatabaseUser();
   const today = new Date().toISOString().slice(0, 10);
-  const [usage] = await db
-    .insert(userAiUsage)
-    .values({ userId: user.id, usageDate: today, actionCount: 1, updatedAt: new Date() })
-    .onConflictDoUpdate({
-      target: [userAiUsage.userId, userAiUsage.usageDate],
-      set: {
-        actionCount: sql`${userAiUsage.actionCount} + 1`,
-        updatedAt: new Date(),
-      },
-    })
-    .returning();
 
-  if (usage.actionCount > freePlanLimits.aiActionsPerDay) {
+  const { data: existing } = await supabase
+    .from("user_ai_usage")
+    .select("action_count")
+    .eq("user_id", user.id)
+    .eq("usage_date", today)
+    .maybeSingle();
+
+  const newCount = (existing?.action_count ?? 0) + 1;
+
+  await supabase
+    .from("user_ai_usage")
+    .upsert(
+      { user_id: user.id, usage_date: today, action_count: newCount, updated_at: new Date().toISOString() },
+      { onConflict: "user_id,usage_date" },
+    );
+
+  if (newCount > freePlanLimits.aiActionsPerDay) {
     throw new Error(`Free plan limit reached: ${freePlanLimits.aiActionsPerDay} AI actions per day. Upgrade to Pro for unlimited AI.`);
   }
 }
 
 export async function exportCurrentUserData() {
   const user = await getCurrentDatabaseUser();
-  const [settings, categories, calendar, boards, userNotes, userSpaces, userWhiteboards, apps] = await Promise.all([
-    db.query.userSettings.findFirst({ where: eq(userSettings.userId, user.id) }),
-    db.query.userCategories.findMany({ where: eq(userCategories.userId, user.id) }),
-    db.query.calendarItems.findMany({ where: eq(calendarItems.userId, user.id) }),
-    db.query.kanbanBoards.findMany({ where: eq(kanbanBoards.userId, user.id) }),
-    db.query.notes.findMany({ where: eq(notes.userId, user.id) }),
-    db.query.spaces.findMany({ where: eq(spaces.userId, user.id) }),
-    db.query.whiteboards.findMany({ where: eq(whiteboards.userId, user.id) }),
-    db.query.generatedApps.findMany({ where: eq(generatedApps.userId, user.id) }),
+
+  const [
+    { data: settings },
+    { data: categories },
+    { data: calendar },
+    { data: boards },
+    { data: userNotes },
+    { data: userSpaces },
+    { data: userWhiteboards },
+    { data: apps },
+  ] = await Promise.all([
+    supabase.from("user_settings").select("*").eq("user_id", user.id).maybeSingle(),
+    supabase.from("user_categories").select("*").eq("user_id", user.id),
+    supabase.from("calendar_items").select("*").eq("user_id", user.id),
+    supabase.from("kanban_boards").select("*").eq("user_id", user.id),
+    supabase.from("notes").select("*").eq("user_id", user.id),
+    supabase.from("spaces").select("*").eq("user_id", user.id),
+    supabase.from("whiteboards").select("*").eq("user_id", user.id),
+    supabase.from("generated_apps").select("*").eq("user_id", user.id),
   ]);
 
   return {

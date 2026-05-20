@@ -2,21 +2,9 @@
 
 import { GoogleGenAI } from "@google/genai";
 import { currentUser } from "@clerk/nextjs/server";
-import { and, asc, eq, inArray, or } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import {
-  db,
-  kanbanBoards,
-  kanbanColumns,
-  kanbanTasks,
-  pageComments,
-  pageTaskLinks,
-  spacePages,
-  spaceShares,
-  spaces,
-  users,
-} from "@/db";
+import { supabase } from "@/db";
 import { getAvatarColor, getInitials, getLiveblocksUserId, normalizeCollaborationEmail } from "@/lib/liveblocks";
 import { assertAiFeatureEnabled, assertFreePlanLimit, recordAiAction } from "@/lib/user-preferences";
 
@@ -195,153 +183,177 @@ async function getCurrentDatabaseUser() {
   const liveblocksId = getLiveblocksUserId(normalizedEmail);
   const name = user.fullName || user.username || normalizedEmail.split("@")[0] || null;
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email: normalizedEmail, liveblocksId, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email: normalizedEmail, liveblocksId, name },
-    })
-    .returning({ id: users.id, email: users.email, liveblocksId: users.liveblocksId, name: users.name });
+  const { data: databaseUser, error } = await supabase
+    .from("users")
+    .upsert(
+      { clerk_id: clerkId, email: normalizedEmail, liveblocks_id: liveblocksId, name },
+      { onConflict: "clerk_id" },
+    )
+    .select("id, email, liveblocks_id, name")
+    .single();
 
-  await db
-    .update(spaceShares)
-    .set({ acceptedUserId: databaseUser.id, updatedAt: new Date() })
-    .where(and(eq(spaceShares.email, normalizedEmail), eq(spaceShares.role, "editor")));
+  if (error) throw new Error(error.message);
 
-  return { ...databaseUser, email: normalizedEmail, liveblocksId };
+  await supabase
+    .from("space_shares")
+    .update({ accepted_user_id: databaseUser.id, updated_at: new Date().toISOString() })
+    .eq("email", normalizedEmail)
+    .eq("role", "editor");
+
+  return { id: databaseUser.id, email: normalizedEmail, liveblocksId, name: databaseUser.name };
 }
 
 async function assertSpaceOwner(spaceId: number, userId: number) {
-  const space = await db.query.spaces.findFirst({ where: and(eq(spaces.id, spaceId), eq(spaces.userId, userId)) });
+  const { data: space } = await supabase.from("spaces").select("*").eq("id", spaceId).eq("user_id", userId).maybeSingle();
   if (!space) throw new Error("Space not found.");
   return space;
 }
 
 async function assertSpaceAccess(spaceId: number, user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const space = await db.query.spaces.findFirst({ where: eq(spaces.id, spaceId) });
+  const { data: space } = await supabase.from("spaces").select("*").eq("id", spaceId).maybeSingle();
   if (!space) throw new Error("Space not found.");
-  if (space.userId === user.id) return { space, canManage: true };
+  if (space.user_id === user.id) return { space, canManage: true };
 
-  const share = await db.query.spaceShares.findFirst({
-    where: and(eq(spaceShares.spaceId, spaceId), eq(spaceShares.email, user.email), eq(spaceShares.role, "editor")),
-  });
+  const { data: share } = await supabase
+    .from("space_shares")
+    .select("*")
+    .eq("space_id", spaceId)
+    .eq("email", user.email)
+    .eq("role", "editor")
+    .maybeSingle();
+
   if (!share) throw new Error("Space not found.");
   return { space, canManage: false };
 }
 
 async function assertPageAccess(pageId: number, user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const page = await db.query.spacePages.findFirst({ where: eq(spacePages.id, pageId) });
+  const { data: page } = await supabase.from("space_pages").select("*").eq("id", pageId).maybeSingle();
   if (!page) throw new Error("Page not found.");
-  const access = await assertSpaceAccess(page.spaceId, user);
+  const access = await assertSpaceAccess(page.space_id, user);
   return { page, ...access };
 }
 
 async function listAccessibleTaskIds(user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const ownedRows = await db
-    .select({ taskId: kanbanTasks.id })
-    .from(kanbanTasks)
-    .innerJoin(kanbanColumns, eq(kanbanTasks.columnId, kanbanColumns.id))
-    .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(eq(kanbanBoards.userId, user.id));
+  const { data: rows } = await supabase
+    .from("kanban_tasks")
+    .select("id, kanban_columns!inner(kanban_boards!inner(user_id))")
+    .eq("kanban_columns.kanban_boards.user_id", user.id);
 
-  return Array.from(new Set(ownedRows.map((row) => row.taskId)));
+  return Array.from(new Set((rows ?? []).map((row: any) => row.id)));
 }
 
 async function buildSpacesData(user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>): Promise<SpacesDataDTO> {
-  const ownedSpaces = await db.query.spaces.findMany({
-    where: eq(spaces.userId, user.id),
-    orderBy: [asc(spaces.createdAt), asc(spaces.id)],
-  });
-  const sharedRows = await db
-    .select({ space: spaces })
-    .from(spaceShares)
-    .innerJoin(spaces, eq(spaceShares.spaceId, spaces.id))
-    .where(and(eq(spaceShares.email, user.email), eq(spaceShares.role, "editor")))
-    .orderBy(asc(spaces.createdAt), asc(spaces.id));
+  const [{ data: ownedSpaces }, { data: sharedRows }] = await Promise.all([
+    supabase.from("spaces").select("*").eq("user_id", user.id).order("created_at").order("id"),
+    supabase
+      .from("space_shares")
+      .select("*, spaces!inner(*)")
+      .eq("email", user.email)
+      .eq("role", "editor"),
+  ]);
 
   const accessibleSpaces = Array.from(
-    new Map([...ownedSpaces, ...sharedRows.map((row) => row.space)].map((space) => [space.id, space])).values(),
-  ).sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id - right.id);
+    new Map(
+      [...(ownedSpaces ?? []), ...(sharedRows ?? []).map((row: any) => row.spaces)].map((space) => [space.id, space]),
+    ).values(),
+  ).sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime() || left.id - right.id);
+
+  const tasksResult = await listLinkedTasks(user);
 
   if (accessibleSpaces.length === 0) {
-    return { spaces: [], tasks: await listLinkedTasks(user) };
+    return { spaces: [], tasks: tasksResult };
   }
 
   const spaceIds = accessibleSpaces.map((space) => space.id);
-  const ownerIds = Array.from(new Set(accessibleSpaces.map((space) => space.userId)));
-  const owners = await db.query.users.findMany({ where: inArray(users.id, ownerIds) });
-  const ownerById = new Map(owners.map((owner) => [owner.id, owner]));
-  const shares = await db.query.spaceShares.findMany({
-    where: inArray(spaceShares.spaceId, spaceIds),
-    orderBy: [asc(spaceShares.createdAt), asc(spaceShares.id)],
-  });
-  const acceptedUserIds = shares.map((share) => share.acceptedUserId).filter((id): id is number => Boolean(id));
-  const acceptedUsers = acceptedUserIds.length > 0 ? await db.query.users.findMany({ where: inArray(users.id, acceptedUserIds) }) : [];
-  const acceptedUserById = new Map(acceptedUsers.map((acceptedUser) => [acceptedUser.id, acceptedUser]));
-  const sharesBySpace = shares.reduce<Record<number, SpaceCollaboratorDTO[]>>((grouped, share) => {
-    const acceptedUser = share.acceptedUserId ? acceptedUserById.get(share.acceptedUserId) : null;
-    grouped[share.spaceId] = [
-      ...(grouped[share.spaceId] || []),
+  const ownerIds = Array.from(new Set(accessibleSpaces.map((space) => space.user_id)));
+
+  const [
+    { data: owners },
+    { data: shares },
+    { data: pages },
+  ] = await Promise.all([
+    supabase.from("users").select("*").in("id", ownerIds),
+    supabase.from("space_shares").select("*").in("space_id", spaceIds).order("created_at").order("id"),
+    supabase.from("space_pages").select("*").in("space_id", spaceIds).order("created_at").order("id"),
+  ]);
+
+  const ownerById = new Map((owners ?? []).map((owner: any) => [owner.id, owner]));
+  const acceptedUserIds = (shares ?? []).map((share: any) => share.accepted_user_id).filter(Boolean);
+  const { data: acceptedUsers } = acceptedUserIds.length > 0
+    ? await supabase.from("users").select("*").in("id", acceptedUserIds)
+    : { data: [] };
+  const acceptedUserById = new Map((acceptedUsers ?? []).map((u: any) => [u.id, u]));
+
+  const sharesBySpace = (shares ?? []).reduce<Record<number, SpaceCollaboratorDTO[]>>((grouped, share: any) => {
+    const acceptedUser = share.accepted_user_id ? acceptedUserById.get(share.accepted_user_id) : null;
+    grouped[share.space_id] = [
+      ...(grouped[share.space_id] || []),
       toCollaboratorDTO({
-        id: acceptedUser?.id ?? null,
-        name: acceptedUser?.name ?? null,
+        id: (acceptedUser as any)?.id ?? null,
+        name: (acceptedUser as any)?.name ?? null,
         email: share.email,
-        liveblocksId: acceptedUser?.liveblocksId,
+        liveblocksId: (acceptedUser as any)?.liveblocks_id,
         role: "editor",
       }),
     ];
     return grouped;
   }, {});
 
-  const pages = await db.query.spacePages.findMany({
-    where: inArray(spacePages.spaceId, spaceIds),
-    orderBy: [asc(spacePages.createdAt), asc(spacePages.id)],
-  });
-  const pageIds = pages.map((page) => page.id);
-  const updaterIds = pages.map((page) => page.updatedByUserId).filter((id): id is number => Boolean(id));
-  const updaters = updaterIds.length > 0 ? await db.query.users.findMany({ where: inArray(users.id, updaterIds) }) : [];
-  const updaterById = new Map(updaters.map((updater) => [updater.id, updater]));
-  const comments = pageIds.length > 0 ? await db.query.pageComments.findMany({ where: inArray(pageComments.pageId, pageIds) }) : [];
-  const links = pageIds.length > 0 ? await db.query.pageTaskLinks.findMany({ where: inArray(pageTaskLinks.pageId, pageIds) }) : [];
-  const commentsByPage = comments.reduce<Record<number, number>>((grouped, comment) => {
-    grouped[comment.pageId] = (grouped[comment.pageId] || 0) + 1;
+  const pageIds = (pages ?? []).map((page: any) => page.id);
+  const updaterIds = (pages ?? []).map((page: any) => page.updated_by_user_id).filter(Boolean);
+  const { data: updaters } = updaterIds.length > 0
+    ? await supabase.from("users").select("*").in("id", updaterIds)
+    : { data: [] };
+  const updaterById = new Map((updaters ?? []).map((u: any) => [u.id, u]));
+
+  const [{ data: comments }, { data: links }] = await Promise.all([
+    pageIds.length > 0
+      ? supabase.from("page_comments").select("page_id").in("page_id", pageIds)
+      : Promise.resolve({ data: [] }),
+    pageIds.length > 0
+      ? supabase.from("page_task_links").select("page_id, task_id").in("page_id", pageIds)
+      : Promise.resolve({ data: [] }),
+  ]);
+
+  const commentsByPage = (comments ?? []).reduce<Record<number, number>>((grouped, comment: any) => {
+    grouped[comment.page_id] = (grouped[comment.page_id] || 0) + 1;
     return grouped;
   }, {});
-  const linksByPage = links.reduce<Record<number, number[]>>((grouped, link) => {
-    grouped[link.pageId] = [...(grouped[link.pageId] || []), link.taskId];
+  const linksByPage = (links ?? []).reduce<Record<number, number[]>>((grouped, link: any) => {
+    grouped[link.page_id] = [...(grouped[link.page_id] || []), link.task_id];
     return grouped;
   }, {});
-  const pagesBySpace = pages.reduce<Record<number, SpacePageDTO[]>>((grouped, page) => {
-    const updater = page.updatedByUserId ? updaterById.get(page.updatedByUserId) : null;
-    grouped[page.spaceId] = [
-      ...(grouped[page.spaceId] || []),
+
+  const pagesBySpace = (pages ?? []).reduce<Record<number, SpacePageDTO[]>>((grouped, page: any) => {
+    const updater = page.updated_by_user_id ? updaterById.get(page.updated_by_user_id) : null;
+    grouped[page.space_id] = [
+      ...(grouped[page.space_id] || []),
       {
         id: page.id,
-        spaceId: page.spaceId,
+        spaceId: page.space_id,
         title: page.title,
         template: normalizePageTemplate(page.template),
-        pageType: page.pageType,
+        pageType: page.page_type,
         description: page.description,
         content: page.content,
-        plainText: page.plainText,
-        wordCount: page.wordCount,
-        isFavorite: page.isFavorite,
-        isArchived: page.isArchived,
+        plainText: page.plain_text,
+        wordCount: page.word_count,
+        isFavorite: page.is_favorite,
+        isArchived: page.is_archived,
         commentsCount: commentsByPage[page.id] || 0,
         linkedTasksCount: linksByPage[page.id]?.length || 0,
         linkedTaskIds: linksByPage[page.id] || [],
         updatedBy: updater
           ? toCollaboratorDTO({
-              id: updater.id,
-              name: updater.name,
-              email: updater.email,
-              liveblocksId: updater.liveblocksId,
+              id: (updater as any).id,
+              name: (updater as any).name,
+              email: (updater as any).email,
+              liveblocksId: (updater as any).liveblocks_id,
               role: "editor",
             })
           : null,
-        createdAt: page.createdAt.toISOString(),
-        updatedAt: page.updatedAt.toISOString(),
+        createdAt: page.created_at,
+        updatedAt: page.updated_at,
       },
     ];
     return grouped;
@@ -352,36 +364,38 @@ async function buildSpacesData(user: Awaited<ReturnType<typeof getCurrentDatabas
     name: space.name,
     description: space.description,
     color: normalizeSpaceColor(space.color),
-    isFavorite: space.isFavorite,
-    isArchived: space.isArchived,
+    isFavorite: space.is_favorite,
+    isArchived: space.is_archived,
     owner: toCollaboratorDTO({
-      id: space.userId,
-      name: ownerById.get(space.userId)?.name ?? null,
-      email: ownerById.get(space.userId)?.email ?? user.email,
-      liveblocksId: ownerById.get(space.userId)?.liveblocksId,
+      id: space.user_id,
+      name: (ownerById.get(space.user_id) as any)?.name ?? null,
+      email: (ownerById.get(space.user_id) as any)?.email ?? user.email,
+      liveblocksId: (ownerById.get(space.user_id) as any)?.liveblocks_id,
       role: "owner",
     }),
     shares: sharesBySpace[space.id] || [],
-    canManage: space.userId === user.id,
+    canManage: space.user_id === user.id,
     pages: pagesBySpace[space.id] || [],
     pageCount: (pagesBySpace[space.id] || []).filter((page) => !page.isArchived).length,
-    createdAt: space.createdAt.toISOString(),
-    updatedAt: space.updatedAt.toISOString(),
+    createdAt: space.created_at,
+    updatedAt: space.updated_at,
   }));
 
-  return { spaces: data, tasks: await listLinkedTasks(user) };
+  return { spaces: data, tasks: tasksResult };
 }
 
 async function listLinkedTasks(user: Awaited<ReturnType<typeof getCurrentDatabaseUser>>) {
-  const rows = await db
-    .select({ id: kanbanTasks.id, title: kanbanTasks.title, boardName: kanbanBoards.name })
-    .from(kanbanTasks)
-    .innerJoin(kanbanColumns, eq(kanbanTasks.columnId, kanbanColumns.id))
-    .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(eq(kanbanBoards.userId, user.id))
-    .orderBy(asc(kanbanBoards.name), asc(kanbanTasks.title));
+  const { data: rows } = await supabase
+    .from("kanban_tasks")
+    .select("id, title, kanban_columns!inner(kanban_boards!inner(name, user_id))")
+    .eq("kanban_columns.kanban_boards.user_id", user.id)
+    .order("title");
 
-  return rows;
+  return (rows ?? []).map((row: any) => ({
+    id: row.id,
+    title: row.title,
+    boardName: row.kanban_columns?.kanban_boards?.name ?? "Kanban board",
+  }));
 }
 
 export async function listSpacesData() {
@@ -394,12 +408,12 @@ export async function createSpace(input: SpaceInput) {
   const user = await getCurrentDatabaseUser();
   const name = cleanTitle(input.name, "Untitled Space");
 
-  await db.insert(spaces).values({
-    userId: user.id,
+  await supabase.from("spaces").insert({
+    user_id: user.id,
     name,
     description: cleanOptionalText(input.description),
     color: normalizeSpaceColor(input.color),
-    updatedAt: new Date(),
+    updated_at: new Date().toISOString(),
   });
 
   revalidatePath("/spaces");
@@ -410,17 +424,18 @@ export async function updateSpace(spaceId: number, input: Partial<SpaceInput> & 
   const user = await getCurrentDatabaseUser();
   const space = await assertSpaceOwner(spaceId, user.id);
 
-  await db
-    .update(spaces)
-    .set({
+  await supabase
+    .from("spaces")
+    .update({
       name: typeof input.name === "string" ? cleanTitle(input.name, "Untitled Space") : space.name,
       description: typeof input.description !== "undefined" ? cleanOptionalText(input.description) : space.description,
       color: typeof input.color === "string" ? normalizeSpaceColor(input.color) : normalizeSpaceColor(space.color),
-      isFavorite: typeof input.isFavorite === "boolean" ? input.isFavorite : space.isFavorite,
-      isArchived: typeof input.isArchived === "boolean" ? input.isArchived : space.isArchived,
-      updatedAt: new Date(),
+      is_favorite: typeof input.isFavorite === "boolean" ? input.isFavorite : space.is_favorite,
+      is_archived: typeof input.isArchived === "boolean" ? input.isArchived : space.is_archived,
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(spaces.id, spaceId), eq(spaces.userId, user.id)));
+    .eq("id", spaceId)
+    .eq("user_id", user.id);
 
   revalidatePath("/spaces");
   return buildSpacesData(user);
@@ -429,7 +444,7 @@ export async function updateSpace(spaceId: number, input: Partial<SpaceInput> & 
 export async function deleteSpace(spaceId: number) {
   const user = await getCurrentDatabaseUser();
   await assertSpaceOwner(spaceId, user.id);
-  await db.delete(spaces).where(and(eq(spaces.id, spaceId), eq(spaces.userId, user.id)));
+  await supabase.from("spaces").delete().eq("id", spaceId).eq("user_id", user.id);
   revalidatePath("/spaces");
   return buildSpacesData(user);
 }
@@ -437,32 +452,36 @@ export async function deleteSpace(spaceId: number) {
 export async function duplicateSpace(spaceId: number) {
   const user = await getCurrentDatabaseUser();
   const { space } = await assertSpaceAccess(spaceId, user);
-  const pages = await db.query.spacePages.findMany({ where: eq(spacePages.spaceId, space.id) });
-  const now = new Date();
-  const [copy] = await db
-    .insert(spaces)
-    .values({
-      userId: user.id,
+  const { data: pages } = await supabase.from("space_pages").select("*").eq("space_id", space.id);
+  const now = new Date().toISOString();
+
+  const { data: copy, error } = await supabase
+    .from("spaces")
+    .insert({
+      user_id: user.id,
       name: `${space.name} copy`,
       description: space.description,
       color: normalizeSpaceColor(space.color),
-      updatedAt: now,
+      updated_at: now,
     })
-    .returning();
+    .select()
+    .single();
 
-  if (pages.length > 0) {
-    await db.insert(spacePages).values(
-      pages.map((page) => ({
-        spaceId: copy.id,
+  if (error) throw new Error(error.message);
+
+  if ((pages ?? []).length > 0) {
+    await supabase.from("space_pages").insert(
+      (pages ?? []).map((page: any) => ({
+        space_id: copy.id,
         title: page.title,
         template: page.template,
-        pageType: page.pageType,
+        page_type: page.page_type,
         description: page.description,
         content: page.content,
-        plainText: page.plainText,
-        wordCount: page.wordCount,
-        updatedByUserId: user.id,
-        updatedAt: now,
+        plain_text: page.plain_text,
+        word_count: page.word_count,
+        updated_by_user_id: user.id,
+        updated_at: now,
       })),
     );
   }
@@ -479,21 +498,21 @@ export async function inviteSpaceCollaborator(input: { spaceId: number; email: s
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Enter a valid collaborator email.");
   if (email === user.email) throw new Error("You already own this space.");
 
-  const acceptedUser = await db.query.users.findFirst({ where: eq(users.email, email) });
-  await db
-    .insert(spaceShares)
-    .values({
-      spaceId: space.id,
-      email,
-      role: "editor",
-      invitedByUserId: user.id,
-      acceptedUserId: acceptedUser?.id ?? null,
-      updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: [spaceShares.spaceId, spaceShares.email],
-      set: { role: "editor", invitedByUserId: user.id, acceptedUserId: acceptedUser?.id ?? null, updatedAt: new Date() },
-    });
+  const { data: acceptedUser } = await supabase.from("users").select("id").eq("email", email).maybeSingle();
+
+  await supabase
+    .from("space_shares")
+    .upsert(
+      {
+        space_id: space.id,
+        email,
+        role: "editor",
+        invited_by_user_id: user.id,
+        accepted_user_id: (acceptedUser as any)?.id ?? null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "space_id,email" },
+    );
 
   revalidatePath("/spaces");
   return buildSpacesData(user);
@@ -504,21 +523,22 @@ export async function createPage(input: PageInput) {
   await assertSpaceAccess(input.spaceId, user);
   const template = normalizePageTemplate(input.template);
   const title = cleanTitle(input.title, "Untitled Page");
-  const now = new Date();
+  const now = new Date().toISOString();
 
-  await db.insert(spacePages).values({
-    spaceId: input.spaceId,
+  await supabase.from("space_pages").insert({
+    space_id: input.spaceId,
     title,
     template,
-    pageType: pageTypeForTemplate(template),
+    page_type: pageTypeForTemplate(template),
     description: cleanOptionalText(input.description),
     content: templateContent(title, template),
-    plainText: "",
-    wordCount: 0,
-    updatedByUserId: user.id,
-    updatedAt: now,
+    plain_text: "",
+    word_count: 0,
+    updated_by_user_id: user.id,
+    updated_at: now,
   });
-  await db.update(spaces).set({ updatedAt: now }).where(eq(spaces.id, input.spaceId));
+
+  await supabase.from("spaces").update({ updated_at: now }).eq("id", input.spaceId);
 
   revalidatePath("/spaces");
   return buildSpacesData(user);
@@ -528,29 +548,31 @@ export async function updatePage(pageId: number, input: Partial<PageInput> & { i
   const user = await getCurrentDatabaseUser();
   const { page } = await assertPageAccess(pageId, user);
   const template = typeof input.template === "string" ? normalizePageTemplate(input.template) : normalizePageTemplate(page.template);
-  const nextSpaceId = typeof input.spaceId === "number" ? input.spaceId : page.spaceId;
+  const nextSpaceId = typeof input.spaceId === "number" ? input.spaceId : page.space_id;
 
-  if (nextSpaceId !== page.spaceId) {
+  if (nextSpaceId !== page.space_id) {
     await assertSpaceAccess(nextSpaceId, user);
   }
 
-  const now = new Date();
-  await db
-    .update(spacePages)
-    .set({
-      spaceId: nextSpaceId,
+  const now = new Date().toISOString();
+  await supabase
+    .from("space_pages")
+    .update({
+      space_id: nextSpaceId,
       title: typeof input.title === "string" ? cleanTitle(input.title, "Untitled Page") : page.title,
       template,
-      pageType: pageTypeForTemplate(template),
+      page_type: pageTypeForTemplate(template),
       description: typeof input.description !== "undefined" ? cleanOptionalText(input.description) : page.description,
-      isFavorite: typeof input.isFavorite === "boolean" ? input.isFavorite : page.isFavorite,
-      isArchived: typeof input.isArchived === "boolean" ? input.isArchived : page.isArchived,
-      updatedByUserId: user.id,
-      updatedAt: now,
+      is_favorite: typeof input.isFavorite === "boolean" ? input.isFavorite : page.is_favorite,
+      is_archived: typeof input.isArchived === "boolean" ? input.isArchived : page.is_archived,
+      updated_by_user_id: user.id,
+      updated_at: now,
     })
-    .where(eq(spacePages.id, pageId));
+    .eq("id", pageId);
 
-  await db.update(spaces).set({ updatedAt: now }).where(or(eq(spaces.id, page.spaceId), eq(spaces.id, nextSpaceId)));
+  const spaceIdsToTouch = Array.from(new Set([page.space_id, nextSpaceId]));
+  await Promise.all(spaceIdsToTouch.map((id) => supabase.from("spaces").update({ updated_at: now }).eq("id", id)));
+
   revalidatePath("/spaces");
   return buildSpacesData(user);
 }
@@ -559,19 +581,21 @@ export async function updatePageContent(pageId: number, input: PageContentInput)
   const user = await getCurrentDatabaseUser();
   const { page } = await assertPageAccess(pageId, user);
   const plainText = cleanPlainText(input.plainText);
-  const now = new Date();
+  const now = new Date().toISOString();
 
-  await db
-    .update(spacePages)
-    .set({
+  await supabase
+    .from("space_pages")
+    .update({
       content: input.content,
-      plainText,
-      wordCount: Math.max(0, Number.isFinite(input.wordCount) ? input.wordCount : countWords(plainText)),
-      updatedByUserId: user.id,
-      updatedAt: now,
+      plain_text: plainText,
+      word_count: Math.max(0, Number.isFinite(input.wordCount) ? input.wordCount : countWords(plainText)),
+      updated_by_user_id: user.id,
+      updated_at: now,
     })
-    .where(and(eq(spacePages.id, pageId), eq(spacePages.isArchived, false)));
-  await db.update(spaces).set({ updatedAt: now }).where(eq(spaces.id, page.spaceId));
+    .eq("id", pageId)
+    .eq("is_archived", false);
+
+  await supabase.from("spaces").update({ updated_at: now }).eq("id", page.space_id);
 
   revalidatePath("/spaces");
   return buildSpacesData(user);
@@ -580,21 +604,22 @@ export async function updatePageContent(pageId: number, input: PageContentInput)
 export async function duplicatePage(pageId: number) {
   const user = await getCurrentDatabaseUser();
   const { page } = await assertPageAccess(pageId, user);
-  const now = new Date();
+  const now = new Date().toISOString();
 
-  await db.insert(spacePages).values({
-    spaceId: page.spaceId,
+  await supabase.from("space_pages").insert({
+    space_id: page.space_id,
     title: `${page.title} copy`,
     template: page.template,
-    pageType: page.pageType,
+    page_type: page.page_type,
     description: page.description,
     content: page.content,
-    plainText: page.plainText,
-    wordCount: page.wordCount,
-    updatedByUserId: user.id,
-    updatedAt: now,
+    plain_text: page.plain_text,
+    word_count: page.word_count,
+    updated_by_user_id: user.id,
+    updated_at: now,
   });
-  await db.update(spaces).set({ updatedAt: now }).where(eq(spaces.id, page.spaceId));
+
+  await supabase.from("spaces").update({ updated_at: now }).eq("id", page.space_id);
 
   revalidatePath("/spaces");
   return buildSpacesData(user);
@@ -603,8 +628,8 @@ export async function duplicatePage(pageId: number) {
 export async function deletePage(pageId: number) {
   const user = await getCurrentDatabaseUser();
   const { page } = await assertPageAccess(pageId, user);
-  await db.delete(spacePages).where(eq(spacePages.id, pageId));
-  await db.update(spaces).set({ updatedAt: new Date() }).where(eq(spaces.id, page.spaceId));
+  await supabase.from("space_pages").delete().eq("id", pageId);
+  await supabase.from("spaces").update({ updated_at: new Date().toISOString() }).eq("id", page.space_id);
   revalidatePath("/spaces");
   return buildSpacesData(user);
 }
@@ -615,9 +640,9 @@ export async function updatePageTaskLinks(pageId: number, taskIds: number[]) {
   const allowedTaskIds = await listAccessibleTaskIds(user);
   const cleanIds = Array.from(new Set(taskIds.filter((id) => allowedTaskIds.includes(id)))).slice(0, 20);
 
-  await db.delete(pageTaskLinks).where(eq(pageTaskLinks.pageId, pageId));
+  await supabase.from("page_task_links").delete().eq("page_id", pageId);
   if (cleanIds.length > 0) {
-    await db.insert(pageTaskLinks).values(cleanIds.map((taskId) => ({ pageId, taskId })));
+    await supabase.from("page_task_links").insert(cleanIds.map((taskId) => ({ page_id: pageId, task_id: taskId })));
   }
 
   revalidatePath("/spaces");

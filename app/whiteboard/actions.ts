@@ -2,10 +2,9 @@
 
 import { GoogleGenAI } from "@google/genai";
 import { currentUser } from "@clerk/nextjs/server";
-import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
-import { db, users, whiteboards } from "@/db";
+import { supabase } from "@/db";
 import { assertAiFeatureEnabled, assertFreePlanLimit, recordAiAction } from "@/lib/user-preferences";
 
 const whiteboardColors = ["sage", "clay", "amber", "sky", "violet"] as const;
@@ -61,15 +60,15 @@ function safeJsonRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function toDTO(board: typeof whiteboards.$inferSelect): WhiteboardDTO {
+function toDTO(board: any): WhiteboardDTO {
   return {
     id: board.id,
     name: board.name,
     color: normalizeColor(board.color),
     scene: safeJsonRecord(board.scene),
     files: safeJsonRecord(board.files),
-    createdAt: board.createdAt.toISOString(),
-    updatedAt: board.updatedAt.toISOString(),
+    createdAt: board.created_at,
+    updatedAt: board.updated_at,
   };
 }
 
@@ -88,22 +87,23 @@ async function getCurrentDatabaseUserId() {
 
   const name = user.fullName || user.username || email.split("@")[0] || null;
 
-  const [databaseUser] = await db
-    .insert(users)
-    .values({ clerkId, email, name })
-    .onConflictDoUpdate({
-      target: users.clerkId,
-      set: { email, name },
-    })
-    .returning({ id: users.id });
+  const { data, error } = await supabase
+    .from("users")
+    .upsert({ clerk_id: clerkId, email, name }, { onConflict: "clerk_id" })
+    .select("id")
+    .single();
 
-  return databaseUser.id;
+  if (error) throw new Error(error.message);
+  return data.id;
 }
 
 async function assertWhiteboardAccess(boardId: number, userId: number) {
-  const board = await db.query.whiteboards.findFirst({
-    where: and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)),
-  });
+  const { data: board } = await supabase
+    .from("whiteboards")
+    .select("*")
+    .eq("id", boardId)
+    .eq("user_id", userId)
+    .maybeSingle();
 
   if (!board) {
     throw new Error("Whiteboard not found.");
@@ -114,26 +114,29 @@ async function assertWhiteboardAccess(boardId: number, userId: number) {
 
 export async function listWhiteboards() {
   const userId = await getCurrentDatabaseUserId();
-  const userBoards = await db.query.whiteboards.findMany({
-    where: eq(whiteboards.userId, userId),
-  });
+  const { data: userBoards } = await supabase
+    .from("whiteboards")
+    .select("*")
+    .eq("user_id", userId);
 
-  return userBoards.map(toDTO).sort(sortBoards);
+  return (userBoards ?? []).map(toDTO).sort(sortBoards);
 }
 
 export async function createWhiteboard(input?: { name?: string; color?: string }) {
   await assertFreePlanLimit("whiteboards");
   const userId = await getCurrentDatabaseUserId();
-  const existing = await db.query.whiteboards.findMany({
-    where: eq(whiteboards.userId, userId),
-    columns: { id: true },
-  });
-  const color = normalizeColor(input?.color || whiteboardColors[existing.length % whiteboardColors.length]);
-  const now = new Date();
-  const [board] = await db
-    .insert(whiteboards)
-    .values({
-      userId,
+  const { data: existing } = await supabase
+    .from("whiteboards")
+    .select("id")
+    .eq("user_id", userId);
+
+  const count = existing?.length ?? 0;
+  const color = normalizeColor(input?.color || whiteboardColors[count % whiteboardColors.length]);
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("whiteboards")
+    .insert({
+      user_id: userId,
       name: cleanName(input?.name || "Untitled whiteboard"),
       color,
       scene: {
@@ -143,32 +146,39 @@ export async function createWhiteboard(input?: { name?: string; color?: string }
         },
       },
       files: {},
-      updatedAt: now,
+      updated_at: now,
     })
-    .returning();
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/whiteboard");
-  return toDTO(board);
+  return toDTO(data);
 }
 
 export async function renameWhiteboard(boardId: number, name: string) {
   const userId = await getCurrentDatabaseUserId();
   await assertWhiteboardAccess(boardId, userId);
 
-  const [board] = await db
-    .update(whiteboards)
-    .set({ name: cleanName(name), updatedAt: new Date() })
-    .where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)))
-    .returning();
+  const { data, error } = await supabase
+    .from("whiteboards")
+    .update({ name: cleanName(name), updated_at: new Date().toISOString() })
+    .eq("id", boardId)
+    .eq("user_id", userId)
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
 
   revalidatePath("/whiteboard");
-  return toDTO(board);
+  return toDTO(data);
 }
 
 export async function deleteWhiteboard(boardId: number) {
   const userId = await getCurrentDatabaseUserId();
   await assertWhiteboardAccess(boardId, userId);
-  await db.delete(whiteboards).where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)));
+  await supabase.from("whiteboards").delete().eq("id", boardId).eq("user_id", userId);
   revalidatePath("/whiteboard");
   const remaining = await listWhiteboards();
   if (remaining.length) return remaining;
@@ -179,17 +189,21 @@ export async function updateWhiteboardScene(boardId: number, input: { scene: Whi
   const userId = await getCurrentDatabaseUserId();
   await assertWhiteboardAccess(boardId, userId);
 
-  const [board] = await db
-    .update(whiteboards)
-    .set({
+  const { data, error } = await supabase
+    .from("whiteboards")
+    .update({
       scene: safeJsonRecord(input.scene),
       files: safeJsonRecord(input.files),
-      updatedAt: new Date(),
+      updated_at: new Date().toISOString(),
     })
-    .where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)))
-    .returning();
+    .eq("id", boardId)
+    .eq("user_id", userId)
+    .select()
+    .single();
 
-  return toDTO(board);
+  if (error) throw new Error(error.message);
+
+  return toDTO(data);
 }
 
 function cleanDiagramKind(value: unknown): DiagramKind {

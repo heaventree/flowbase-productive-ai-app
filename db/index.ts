@@ -1,9 +1,10 @@
-import { neon } from '@neondatabase/serverless';
-import { drizzle } from 'drizzle-orm/neon-http';
-import * as schema from '@/db/schema';
+import { createClient } from "@supabase/supabase-js";
 
-const databaseUrl = process.env.DATABASE_URL || 'postgresql://placeholder-url';
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-const sql = neon(databaseUrl);
-export const db = drizzle({ client: sql, schema });
-export * from '@/db/schema';
+export const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false },
+});
+
+export * from "@/db/schema";
