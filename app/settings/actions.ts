@@ -1,8 +1,9 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { and, eq } from "drizzle-orm";
 
-import { supabase } from "@/db";
+import { db, userSettings, userCategories } from "@/db";
 import {
   CategoryScope,
   categoryScopes,
@@ -88,21 +89,21 @@ function option<T extends readonly string[]>(value: unknown, options: T, fallbac
 function toSettingsDTO(settings: any): UserSettingsDTO {
   return {
     theme: option(settings.theme, themeOptions, "system"),
-    notificationsEnabled: settings.notifications_enabled,
-    emailNotificationsEnabled: settings.email_notifications_enabled,
-    defaultCalendarView: option(settings.default_calendar_view, calendarViews, "month"),
-    defaultTaskPriority: option(settings.default_task_priority, priorities, "medium"),
-    autoSaveEnabled: settings.auto_save_enabled,
-    privacyModeEnabled: settings.privacy_mode_enabled,
-    twoFactorReminderDismissed: settings.two_factor_reminder_dismissed,
-    aiModel: option(settings.ai_model, aiModels, "gemini-3.1-flash-lite"),
-    aiBehavior: option(settings.ai_behavior, aiBehaviors, "balanced"),
-    aiTone: option(settings.ai_tone, aiTones, "Friendly"),
-    aiRefineEnabled: settings.ai_refine_enabled,
-    aiAssistantEnabled: settings.ai_assistant_enabled,
-    aiTemplateBuilderEnabled: settings.ai_template_builder_enabled,
-    aiDiagramEnabled: settings.ai_diagram_enabled,
-    updatedAt: settings.updated_at,
+    notificationsEnabled: settings.notificationsEnabled,
+    emailNotificationsEnabled: settings.emailNotificationsEnabled,
+    defaultCalendarView: option(settings.defaultCalendarView, calendarViews, "month"),
+    defaultTaskPriority: option(settings.defaultTaskPriority, priorities, "medium"),
+    autoSaveEnabled: settings.autoSaveEnabled,
+    privacyModeEnabled: settings.privacyModeEnabled,
+    twoFactorReminderDismissed: settings.twoFactorReminderDismissed,
+    aiModel: option(settings.aiModel, aiModels, "gemini-3.1-flash-lite"),
+    aiBehavior: option(settings.aiBehavior, aiBehaviors, "balanced"),
+    aiTone: option(settings.aiTone, aiTones, "Friendly"),
+    aiRefineEnabled: settings.aiRefineEnabled,
+    aiAssistantEnabled: settings.aiAssistantEnabled,
+    aiTemplateBuilderEnabled: settings.aiTemplateBuilderEnabled,
+    aiDiagramEnabled: settings.aiDiagramEnabled,
+    updatedAt: settings.updatedAt,
   };
 }
 
@@ -117,36 +118,35 @@ function initials(name: string | null, email: string) {
 }
 
 async function ensureSettings(userId: number) {
-  const { data, error } = await supabase
-    .from("user_settings")
-    .upsert({ user_id: userId, updated_at: new Date().toISOString() }, { onConflict: "user_id" })
-    .select()
-    .single();
+  const result = await db.insert(userSettings)
+    .values({ userId, updatedAt: new Date().toISOString() })
+    .onConflictDoUpdate({
+      target: userSettings.userId,
+      set: { updatedAt: new Date().toISOString() },
+    })
+    .returning();
 
-  if (error) throw new Error(error.message);
-  return data;
+  if (!result[0]) throw new Error("Failed to ensure settings.");
+  return result[0];
 }
 
 async function ensureDefaultCategories(userId: number) {
-  await supabase
-    .from("user_categories")
-    .upsert(
-      defaultCategories.map((category) => ({
-        user_id: userId,
-        scope: category.scope,
-        name: category.name,
-        color: category.color,
-        icon: category.icon,
-      })),
-      { ignoreDuplicates: true },
-    );
+  await db.insert(userCategories)
+    .values(defaultCategories.map((category) => ({
+      userId,
+      scope: category.scope,
+      name: category.name,
+      color: category.color,
+      icon: category.icon,
+    })))
+    .onConflictDoNothing();
 }
 
 export async function listSettingsPageData(): Promise<SettingsPageData> {
   const user = await getCurrentDatabaseUser();
   const [settings] = await Promise.all([ensureSettings(user.id), ensureDefaultCategories(user.id)]);
-  const [{ data: categoriesRaw }, usage, isPro] = await Promise.all([
-    supabase.from("user_categories").select("*").eq("user_id", user.id),
+  const [categoriesRaw, usage, isPro] = await Promise.all([
+    db.select().from(userCategories).where(eq(userCategories.userId, user.id)),
     getUserUsageSnapshot(user.id),
     isCurrentUserPro(),
   ]);
@@ -158,7 +158,7 @@ export async function listSettingsPageData(): Promise<SettingsPageData> {
       initials: initials(user.name, user.email),
     },
     settings: toSettingsDTO(settings),
-    categories: (categoriesRaw ?? []).map(toCategoryDTO),
+    categories: categoriesRaw.map(toCategoryDTO),
     usage,
     limits: freePlanLimits,
     isPro,
@@ -167,34 +167,33 @@ export async function listSettingsPageData(): Promise<SettingsPageData> {
 
 export async function updateUserSettings(input: UserSettingsInput) {
   const user = await getCurrentDatabaseUser();
-  const values: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  const values: Record<string, unknown> = { updatedAt: new Date().toISOString() };
 
   if (typeof input.theme === "string") values.theme = option(input.theme, themeOptions, "system");
-  if (typeof input.notificationsEnabled === "boolean") values.notifications_enabled = input.notificationsEnabled;
-  if (typeof input.emailNotificationsEnabled === "boolean") values.email_notifications_enabled = input.emailNotificationsEnabled;
-  if (typeof input.defaultCalendarView === "string") values.default_calendar_view = option(input.defaultCalendarView, calendarViews, "month");
-  if (typeof input.defaultTaskPriority === "string") values.default_task_priority = option(input.defaultTaskPriority, priorities, "medium");
-  if (typeof input.autoSaveEnabled === "boolean") values.auto_save_enabled = input.autoSaveEnabled;
-  if (typeof input.privacyModeEnabled === "boolean") values.privacy_mode_enabled = input.privacyModeEnabled;
-  if (typeof input.twoFactorReminderDismissed === "boolean") values.two_factor_reminder_dismissed = input.twoFactorReminderDismissed;
-  if (typeof input.aiModel === "string") values.ai_model = option(input.aiModel, aiModels, "gemini-3.1-flash-lite");
-  if (typeof input.aiBehavior === "string") values.ai_behavior = option(input.aiBehavior, aiBehaviors, "balanced");
-  if (typeof input.aiTone === "string") values.ai_tone = option(input.aiTone, aiTones, "Friendly");
-  if (typeof input.aiRefineEnabled === "boolean") values.ai_refine_enabled = input.aiRefineEnabled;
-  if (typeof input.aiAssistantEnabled === "boolean") values.ai_assistant_enabled = input.aiAssistantEnabled;
-  if (typeof input.aiTemplateBuilderEnabled === "boolean") values.ai_template_builder_enabled = input.aiTemplateBuilderEnabled;
-  if (typeof input.aiDiagramEnabled === "boolean") values.ai_diagram_enabled = input.aiDiagramEnabled;
+  if (typeof input.notificationsEnabled === "boolean") values.notificationsEnabled = input.notificationsEnabled;
+  if (typeof input.emailNotificationsEnabled === "boolean") values.emailNotificationsEnabled = input.emailNotificationsEnabled;
+  if (typeof input.defaultCalendarView === "string") values.defaultCalendarView = option(input.defaultCalendarView, calendarViews, "month");
+  if (typeof input.defaultTaskPriority === "string") values.defaultTaskPriority = option(input.defaultTaskPriority, priorities, "medium");
+  if (typeof input.autoSaveEnabled === "boolean") values.autoSaveEnabled = input.autoSaveEnabled;
+  if (typeof input.privacyModeEnabled === "boolean") values.privacyModeEnabled = input.privacyModeEnabled;
+  if (typeof input.twoFactorReminderDismissed === "boolean") values.twoFactorReminderDismissed = input.twoFactorReminderDismissed;
+  if (typeof input.aiModel === "string") values.aiModel = option(input.aiModel, aiModels, "gemini-3.1-flash-lite");
+  if (typeof input.aiBehavior === "string") values.aiBehavior = option(input.aiBehavior, aiBehaviors, "balanced");
+  if (typeof input.aiTone === "string") values.aiTone = option(input.aiTone, aiTones, "Friendly");
+  if (typeof input.aiRefineEnabled === "boolean") values.aiRefineEnabled = input.aiRefineEnabled;
+  if (typeof input.aiAssistantEnabled === "boolean") values.aiAssistantEnabled = input.aiAssistantEnabled;
+  if (typeof input.aiTemplateBuilderEnabled === "boolean") values.aiTemplateBuilderEnabled = input.aiTemplateBuilderEnabled;
+  if (typeof input.aiDiagramEnabled === "boolean") values.aiDiagramEnabled = input.aiDiagramEnabled;
 
-  const { data, error } = await supabase
-    .from("user_settings")
-    .upsert({ user_id: user.id, ...values }, { onConflict: "user_id" })
-    .select()
-    .single();
+  const result = await db.insert(userSettings)
+    .values({ userId: user.id, ...values } as any)
+    .onConflictDoUpdate({ target: userSettings.userId, set: values as any })
+    .returning();
 
-  if (error) throw new Error(error.message);
+  if (!result[0]) throw new Error("Failed to update settings.");
 
   revalidatePath("/settings");
-  return toSettingsDTO(data);
+  return toSettingsDTO(result[0]);
 }
 
 function cleanCategoryInput(input: CategoryInput) {
@@ -215,58 +214,52 @@ function cleanCategoryInput(input: CategoryInput) {
 export async function createCategory(input: CategoryInput) {
   const user = await getCurrentDatabaseUser();
   const category = cleanCategoryInput(input);
-  const { data, error } = await supabase
-    .from("user_categories")
-    .insert({ ...category, user_id: user.id, updated_at: new Date().toISOString() })
-    .select()
-    .single();
 
-  if (error) throw new Error(error.message);
+  const result = await db.insert(userCategories)
+    .values({ ...category, userId: user.id, updatedAt: new Date().toISOString() })
+    .returning();
+
+  if (!result[0]) throw new Error("Failed to create category.");
 
   revalidatePath("/settings");
   revalidatePath("/calendar");
   revalidatePath("/kanban");
   revalidatePath("/notes");
-  return toCategoryDTO(data);
+  return toCategoryDTO(result[0]);
 }
 
 export async function updateCategory(id: number, input: CategoryInput) {
   const user = await getCurrentDatabaseUser();
   const category = cleanCategoryInput(input);
-  const { data, error } = await supabase
-    .from("user_categories")
-    .update({ ...category, updated_at: new Date().toISOString() })
-    .eq("id", id)
-    .eq("user_id", user.id)
-    .select()
-    .single();
 
-  if (error || !data) throw new Error("Category not found.");
+  const result = await db.update(userCategories)
+    .set({ ...category, updatedAt: new Date().toISOString() })
+    .where(and(eq(userCategories.id, id), eq(userCategories.userId, user.id)))
+    .returning();
+
+  if (!result[0]) throw new Error("Category not found.");
 
   revalidatePath("/settings");
   revalidatePath("/calendar");
   revalidatePath("/kanban");
   revalidatePath("/notes");
-  return toCategoryDTO(data);
+  return toCategoryDTO(result[0]);
 }
 
 export async function deleteCategory(id: number) {
   const user = await getCurrentDatabaseUser();
-  const { data, error } = await supabase
-    .from("user_categories")
-    .delete()
-    .eq("id", id)
-    .eq("user_id", user.id)
-    .select()
-    .single();
 
-  if (error || !data) throw new Error("Category not found.");
+  const result = await db.delete(userCategories)
+    .where(and(eq(userCategories.id, id), eq(userCategories.userId, user.id)))
+    .returning();
+
+  if (!result[0]) throw new Error("Category not found.");
 
   revalidatePath("/settings");
   revalidatePath("/calendar");
   revalidatePath("/kanban");
   revalidatePath("/notes");
-  return toCategoryDTO(data);
+  return toCategoryDTO(result[0]);
 }
 
 export async function listCategoriesForScopes(scopes: CategoryScope[]) {

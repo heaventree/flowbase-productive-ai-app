@@ -1,4 +1,6 @@
-import { supabase } from "@/db";
+import { inArray } from "drizzle-orm";
+
+import { db, users } from "@/db";
 import { getAvatarColor, getInitials } from "@/lib/liveblocks";
 
 export async function POST(request: Request) {
@@ -9,12 +11,12 @@ export async function POST(request: Request) {
     return Response.json([]);
   }
 
-  const { data: records } = await supabase.from("users").select("*").in("liveblocks_id", ids);
-  const byLiveblocksId = new Map((records ?? []).map((user: any) => [user.liveblocks_id, user]));
+  const records = await db.select().from(users).where(inArray(users.liveblocksId, ids));
+  const byLiveblocksId = new Map(records.map((user) => [user.liveblocksId, user]));
 
   return Response.json(
     ids.map((id) => {
-      const user = byLiveblocksId.get(id) as any;
+      const user = byLiveblocksId.get(id);
       const display = user?.name || user?.email || "Collaborator";
 
       return {

@@ -3,8 +3,9 @@
 import { GoogleGenAI } from "@google/genai";
 import { currentUser } from "@clerk/nextjs/server";
 import { revalidatePath } from "next/cache";
+import { and, eq } from "drizzle-orm";
 
-import { supabase } from "@/db";
+import { db, users, whiteboards } from "@/db";
 import { assertAiFeatureEnabled, assertFreePlanLimit, recordAiAction } from "@/lib/user-preferences";
 
 const whiteboardColors = ["sage", "clay", "amber", "sky", "violet"] as const;
@@ -67,8 +68,8 @@ function toDTO(board: any): WhiteboardDTO {
     color: normalizeColor(board.color),
     scene: safeJsonRecord(board.scene),
     files: safeJsonRecord(board.files),
-    createdAt: board.created_at,
-    updatedAt: board.updated_at,
+    createdAt: board.createdAt,
+    updatedAt: board.updatedAt,
   };
 }
 
@@ -87,98 +88,78 @@ async function getCurrentDatabaseUserId() {
 
   const name = user.fullName || user.username || email.split("@")[0] || null;
 
-  const { data, error } = await supabase
-    .from("users")
-    .upsert({ clerk_id: clerkId, email, name }, { onConflict: "clerk_id" })
-    .select("id")
-    .single();
+  const result = await db.insert(users)
+    .values({ clerkId, email, name })
+    .onConflictDoUpdate({ target: users.clerkId, set: { email, name } })
+    .returning({ id: users.id });
 
-  if (error) throw new Error(error.message);
-  return data.id;
+  if (!result[0]) throw new Error("Failed to upsert user.");
+  return result[0].id;
 }
 
 async function assertWhiteboardAccess(boardId: number, userId: number) {
-  const { data: board } = await supabase
-    .from("whiteboards")
-    .select("*")
-    .eq("id", boardId)
-    .eq("user_id", userId)
-    .maybeSingle();
+  const rows = await db.select().from(whiteboards)
+    .where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)))
+    .limit(1);
 
-  if (!board) {
+  if (!rows[0]) {
     throw new Error("Whiteboard not found.");
   }
 
-  return board;
+  return rows[0];
 }
 
 export async function listWhiteboards() {
   const userId = await getCurrentDatabaseUserId();
-  const { data: userBoards } = await supabase
-    .from("whiteboards")
-    .select("*")
-    .eq("user_id", userId);
-
-  return (userBoards ?? []).map(toDTO).sort(sortBoards);
+  const userBoards = await db.select().from(whiteboards).where(eq(whiteboards.userId, userId));
+  return userBoards.map(toDTO).sort(sortBoards);
 }
 
 export async function createWhiteboard(input?: { name?: string; color?: string }) {
   await assertFreePlanLimit("whiteboards");
   const userId = await getCurrentDatabaseUserId();
-  const { data: existing } = await supabase
-    .from("whiteboards")
-    .select("id")
-    .eq("user_id", userId);
+  const existing = await db.select({ id: whiteboards.id }).from(whiteboards).where(eq(whiteboards.userId, userId));
 
-  const count = existing?.length ?? 0;
+  const count = existing.length;
   const color = normalizeColor(input?.color || whiteboardColors[count % whiteboardColors.length]);
   const now = new Date().toISOString();
-  const { data, error } = await supabase
-    .from("whiteboards")
-    .insert({
-      user_id: userId,
+
+  const result = await db.insert(whiteboards)
+    .values({
+      userId,
       name: cleanName(input?.name || "Untitled whiteboard"),
       color,
-      scene: {
-        elements: [],
-        appState: {
-          viewBackgroundColor: "#fffdf8",
-        },
-      },
+      scene: { elements: [], appState: { viewBackgroundColor: "#fffdf8" } },
       files: {},
-      updated_at: now,
+      updatedAt: now,
     })
-    .select()
-    .single();
+    .returning();
 
-  if (error) throw new Error(error.message);
+  if (!result[0]) throw new Error("Failed to create whiteboard.");
 
   revalidatePath("/whiteboard");
-  return toDTO(data);
+  return toDTO(result[0]);
 }
 
 export async function renameWhiteboard(boardId: number, name: string) {
   const userId = await getCurrentDatabaseUserId();
   await assertWhiteboardAccess(boardId, userId);
 
-  const { data, error } = await supabase
-    .from("whiteboards")
-    .update({ name: cleanName(name), updated_at: new Date().toISOString() })
-    .eq("id", boardId)
-    .eq("user_id", userId)
-    .select()
-    .single();
+  const result = await db.update(whiteboards)
+    .set({ name: cleanName(name), updatedAt: new Date().toISOString() })
+    .where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)))
+    .returning();
 
-  if (error) throw new Error(error.message);
+  if (!result[0]) throw new Error("Whiteboard not found.");
 
   revalidatePath("/whiteboard");
-  return toDTO(data);
+  return toDTO(result[0]);
 }
 
 export async function deleteWhiteboard(boardId: number) {
   const userId = await getCurrentDatabaseUserId();
   await assertWhiteboardAccess(boardId, userId);
-  await supabase.from("whiteboards").delete().eq("id", boardId).eq("user_id", userId);
+  await db.delete(whiteboards).where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)));
   revalidatePath("/whiteboard");
   const remaining = await listWhiteboards();
   if (remaining.length) return remaining;
@@ -189,21 +170,17 @@ export async function updateWhiteboardScene(boardId: number, input: { scene: Whi
   const userId = await getCurrentDatabaseUserId();
   await assertWhiteboardAccess(boardId, userId);
 
-  const { data, error } = await supabase
-    .from("whiteboards")
-    .update({
+  const result = await db.update(whiteboards)
+    .set({
       scene: safeJsonRecord(input.scene),
       files: safeJsonRecord(input.files),
-      updated_at: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     })
-    .eq("id", boardId)
-    .eq("user_id", userId)
-    .select()
-    .single();
+    .where(and(eq(whiteboards.id, boardId), eq(whiteboards.userId, userId)))
+    .returning();
 
-  if (error) throw new Error(error.message);
-
-  return toDTO(data);
+  if (!result[0]) throw new Error("Whiteboard not found.");
+  return toDTO(result[0]);
 }
 
 function cleanDiagramKind(value: unknown): DiagramKind {
@@ -241,10 +218,7 @@ function cleanDiagram(input: unknown): GeneratedDiagram {
       const from = typeof record.from === "string" ? record.from.trim() : "";
       const to = typeof record.to === "string" ? record.to.trim() : "";
       if (!nodeIds.has(from) || !nodeIds.has(to) || from === to) return null;
-      const nextEdge: GeneratedDiagramEdge = {
-        from,
-        to,
-      };
+      const nextEdge: GeneratedDiagramEdge = { from, to };
       const label = typeof record.label === "string" ? record.label.trim().slice(0, 60) : "";
       if (label) nextEdge.label = label;
       return nextEdge;

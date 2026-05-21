@@ -3,8 +3,9 @@
 import { GoogleGenAI } from "@google/genai";
 import { currentUser } from "@clerk/nextjs/server";
 import { revalidatePath } from "next/cache";
+import { and, desc, eq } from "drizzle-orm";
 
-import { supabase } from "@/db";
+import { db, users, generatedApps } from "@/db";
 import { assertAiFeatureEnabled, isCurrentUserPro, recordAiAction } from "@/lib/user-preferences";
 
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
@@ -303,16 +304,16 @@ function toDTO(app: any): GeneratedAppDTO {
   const definition = cleanDefinition(app.definition);
   return {
     id: app.id,
-    appName: app.app_name,
+    appName: app.appName,
     description: app.description,
     icon: cleanIcon(app.icon),
     color: cleanColor(app.color),
     layout: app.layout,
     definition,
-    appState: cleanAppState(app.app_state),
-    isInSidebar: app.is_in_sidebar,
-    createdAt: app.created_at,
-    updatedAt: app.updated_at,
+    appState: cleanAppState(app.appState),
+    isInSidebar: app.isInSidebar,
+    createdAt: app.createdAt,
+    updatedAt: app.updatedAt,
   };
 }
 
@@ -327,57 +328,46 @@ async function getCurrentDatabaseUserId() {
 
   const name = user.fullName || user.username || email.split("@")[0] || null;
 
-  const { data, error } = await supabase
-    .from("users")
-    .upsert({ clerk_id: clerkId, email, name }, { onConflict: "clerk_id" })
-    .select("id")
-    .single();
+  const result = await db.insert(users)
+    .values({ clerkId, email, name })
+    .onConflictDoUpdate({ target: users.clerkId, set: { email, name } })
+    .returning({ id: users.id });
 
-  if (error) throw new Error(error.message);
-  return data.id;
+  if (!result[0]) throw new Error("Failed to upsert user.");
+  return result[0].id;
 }
 
 async function assertGeneratedAppAccess(appId: number, userId: number) {
-  const { data: app } = await supabase
-    .from("generated_apps")
-    .select("*")
-    .eq("id", appId)
-    .eq("user_id", userId)
-    .maybeSingle();
+  const rows = await db.select().from(generatedApps)
+    .where(and(eq(generatedApps.id, appId), eq(generatedApps.userId, userId)))
+    .limit(1);
 
-  if (!app) {
+  if (!rows[0]) {
     throw new Error("Generated app not found.");
   }
 
-  return app;
+  return rows[0];
 }
 
 export async function listGeneratedApps() {
   const userId = await getCurrentDatabaseUserId();
-  const { data: apps } = await supabase
-    .from("generated_apps")
-    .select("*")
-    .eq("user_id", userId)
-    .order("updated_at", { ascending: false })
-    .order("id", { ascending: false });
+  const apps = await db.select().from(generatedApps)
+    .where(eq(generatedApps.userId, userId))
+    .orderBy(desc(generatedApps.updatedAt), desc(generatedApps.id));
 
-  return (apps ?? []).map(toDTO);
+  return apps.map(toDTO);
 }
 
 export async function listSidebarGeneratedApps(): Promise<GeneratedSidebarAppDTO[]> {
   const userId = await getCurrentDatabaseUserId();
-  const { data: apps } = await supabase
-    .from("generated_apps")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("is_in_sidebar", true)
-    .order("updated_at", { ascending: false })
-    .order("id", { ascending: false })
+  const apps = await db.select().from(generatedApps)
+    .where(and(eq(generatedApps.userId, userId), eq(generatedApps.isInSidebar, true)))
+    .orderBy(desc(generatedApps.updatedAt), desc(generatedApps.id))
     .limit(SIDEBAR_LIMIT);
 
-  return (apps ?? []).map((app: any) => ({
+  return apps.map((app) => ({
     id: app.id,
-    appName: app.app_name,
+    appName: app.appName,
     icon: cleanIcon(app.icon),
     color: cleanColor(app.color),
   }));
@@ -423,57 +413,50 @@ export async function generateGeneratedApp(prompt: string) {
 
   const definition = cleanDefinition(parseJsonResponse(text));
   const now = new Date().toISOString();
-  const { data, error } = await supabase
-    .from("generated_apps")
-    .insert({
-      user_id: userId,
-      app_name: definition.appName,
+
+  const result = await db.insert(generatedApps)
+    .values({
+      userId,
+      appName: definition.appName,
       description: definition.description,
       icon: definition.icon,
       color: definition.color,
       layout: definition.layout,
       definition,
-      app_state: { components: {} },
-      updated_at: now,
+      appState: { components: {} },
+      updatedAt: now,
     })
-    .select()
-    .single();
+    .returning();
 
-  if (error) throw new Error(error.message);
+  if (!result[0]) throw new Error("Failed to save generated app.");
 
   revalidatePath("/ai-template-builder");
-  return toDTO(data);
+  return toDTO(result[0]);
 }
 
 export async function toggleGeneratedAppSidebar(appId: number, shouldShow: boolean) {
   const userId = await getCurrentDatabaseUserId();
   const app = await assertGeneratedAppAccess(appId, userId);
 
-  if (shouldShow && !app.is_in_sidebar) {
-    const { data: existing } = await supabase
-      .from("generated_apps")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("is_in_sidebar", true);
+  if (shouldShow && !app.isInSidebar) {
+    const existing = await db.select({ id: generatedApps.id }).from(generatedApps)
+      .where(and(eq(generatedApps.userId, userId), eq(generatedApps.isInSidebar, true)));
 
-    if ((existing ?? []).length >= SIDEBAR_LIMIT) {
+    if (existing.length >= SIDEBAR_LIMIT) {
       throw new Error("You can add up to 3 generated apps to the sidebar.");
     }
   }
 
-  const { data, error } = await supabase
-    .from("generated_apps")
-    .update({ is_in_sidebar: shouldShow, updated_at: new Date().toISOString() })
-    .eq("id", appId)
-    .eq("user_id", userId)
-    .select()
-    .single();
+  const result = await db.update(generatedApps)
+    .set({ isInSidebar: shouldShow, updatedAt: new Date().toISOString() })
+    .where(and(eq(generatedApps.id, appId), eq(generatedApps.userId, userId)))
+    .returning();
 
-  if (error) throw new Error(error.message);
+  if (!result[0]) throw new Error("Generated app not found.");
 
   revalidatePath("/ai-template-builder");
   revalidatePath(`/ai-template-builder/${appId}`);
-  return toDTO(data);
+  return toDTO(result[0]);
 }
 
 export async function updateGeneratedAppState(appId: number, state: GeneratedAppState) {
@@ -485,25 +468,22 @@ export async function updateGeneratedAppState(appId: number, state: GeneratedApp
     throw new Error("This generated app has reached its saved data limit.");
   }
 
-  const { data, error } = await supabase
-    .from("generated_apps")
-    .update({ app_state: nextState, updated_at: new Date().toISOString() })
-    .eq("id", appId)
-    .eq("user_id", userId)
-    .select()
-    .single();
+  const result = await db.update(generatedApps)
+    .set({ appState: nextState, updatedAt: new Date().toISOString() })
+    .where(and(eq(generatedApps.id, appId), eq(generatedApps.userId, userId)))
+    .returning();
 
-  if (error) throw new Error(error.message);
+  if (!result[0]) throw new Error("Generated app not found.");
 
   revalidatePath("/ai-template-builder");
   revalidatePath(`/ai-template-builder/${appId}`);
-  return toDTO(data);
+  return toDTO(result[0]);
 }
 
 export async function deleteGeneratedApp(appId: number) {
   const userId = await getCurrentDatabaseUserId();
   await assertGeneratedAppAccess(appId, userId);
-  await supabase.from("generated_apps").delete().eq("id", appId).eq("user_id", userId);
+  await db.delete(generatedApps).where(and(eq(generatedApps.id, appId), eq(generatedApps.userId, userId)));
 
   revalidatePath("/ai-template-builder");
   revalidatePath(`/ai-template-builder/${appId}`);

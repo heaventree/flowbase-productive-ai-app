@@ -1,8 +1,23 @@
 import "server-only";
 
 import { auth, currentUser } from "@clerk/nextjs/server";
+import { and, eq, inArray, sql } from "drizzle-orm";
 
-import { supabase } from "@/db";
+import {
+  db,
+  userAiUsage,
+  userCategories,
+  userSettings,
+  users,
+  kanbanBoards,
+  kanbanColumns,
+  kanbanTasks,
+  notes,
+  spaces,
+  whiteboards,
+  generatedApps,
+  calendarItems,
+} from "@/db";
 import { getLiveblocksUserId, normalizeCollaborationEmail } from "@/lib/liveblocks";
 
 export const categoryScopes = ["calendar", "task", "note", "reminder"] as const;
@@ -52,8 +67,8 @@ export function toCategoryDTO(category: any): UserCategoryDTO {
     name: category.name,
     color: cleanHexColor(category.color),
     icon: cleanIconName(category.icon),
-    createdAt: category.created_at,
-    updatedAt: category.updated_at,
+    createdAt: category.createdAt,
+    updatedAt: category.updatedAt,
   };
 }
 
@@ -70,22 +85,22 @@ export async function getCurrentDatabaseUser() {
   const name = user.fullName || user.username || normalizedEmail.split("@")[0] || null;
   const liveblocksId = getLiveblocksUserId(normalizedEmail);
 
-  const { data, error } = await supabase
-    .from("users")
-    .upsert(
-      { clerk_id: clerkId, email: normalizedEmail, liveblocks_id: liveblocksId, name },
-      { onConflict: "clerk_id" },
-    )
-    .select("id, email, name, clerk_id")
-    .single();
+  const result = await db.insert(users)
+    .values({ clerkId, email: normalizedEmail, liveblocksId, name })
+    .onConflictDoUpdate({
+      target: users.clerkId,
+      set: { email: normalizedEmail, liveblocksId, name },
+    })
+    .returning({ id: users.id, email: users.email, name: users.name, clerkId: users.clerkId });
 
-  if (error) throw new Error(error.message);
+  const data = result[0];
+  if (!data) throw new Error("Failed to upsert user.");
 
   return {
     id: data.id,
     email: data.email,
     name: data.name,
-    clerkId: data.clerk_id,
+    clerkId: data.clerkId,
   };
 }
 
@@ -98,13 +113,10 @@ export async function isCurrentUserPro() {
 
 export async function listUserCategories(scopes: CategoryScope[] = [...categoryScopes]) {
   const user = await getCurrentDatabaseUser();
-  const { data: rows } = await supabase
-    .from("user_categories")
-    .select("*")
-    .eq("user_id", user.id)
-    .in("scope", scopes);
+  const rows = await db.select().from(userCategories)
+    .where(and(eq(userCategories.userId, user.id), inArray(userCategories.scope, scopes)));
 
-  return (rows ?? [])
+  return rows
     .map(toCategoryDTO)
     .sort((left, right) => left.scope.localeCompare(right.scope) || left.name.localeCompare(right.name));
 }
@@ -112,37 +124,37 @@ export async function listUserCategories(scopes: CategoryScope[] = [...categoryS
 export async function getUserUsageSnapshot(userId: number) {
   const today = new Date().toISOString().slice(0, 10);
 
-  const [
-    { count: boardCount },
-    { data: taskCountData },
-    { count: noteCount },
-    { count: spaceCount },
-    { count: whiteboardCount },
-    { data: usageData },
-  ] = await Promise.all([
-    supabase.from("kanban_boards").select("*", { count: "exact", head: true }).eq("user_id", userId),
-    supabase
-      .from("kanban_tasks")
-      .select("kanban_columns!inner(kanban_boards!inner(user_id))")
-      .eq("kanban_columns.kanban_boards.user_id", userId),
-    supabase.from("notes").select("*", { count: "exact", head: true }).eq("user_id", userId),
-    supabase.from("spaces").select("*", { count: "exact", head: true }).eq("user_id", userId),
-    supabase.from("whiteboards").select("*", { count: "exact", head: true }).eq("user_id", userId),
-    supabase
-      .from("user_ai_usage")
-      .select("action_count")
-      .eq("user_id", userId)
-      .eq("usage_date", today)
-      .maybeSingle(),
+  const boardRows = await db.select({ count: sql<number>`count(*)` }).from(kanbanBoards).where(eq(kanbanBoards.userId, userId));
+  const boardCount = Number(boardRows[0]?.count ?? 0);
+
+  const userBoardIds = await db.select({ id: kanbanBoards.id }).from(kanbanBoards).where(eq(kanbanBoards.userId, userId));
+  let taskCount = 0;
+  if (userBoardIds.length > 0) {
+    const columnRows = await db.select({ id: kanbanColumns.id }).from(kanbanColumns)
+      .where(inArray(kanbanColumns.boardId, userBoardIds.map((b) => b.id)));
+    if (columnRows.length > 0) {
+      const taskRows = await db.select({ count: sql<number>`count(*)` }).from(kanbanTasks)
+        .where(inArray(kanbanTasks.columnId, columnRows.map((c) => c.id)));
+      taskCount = Number(taskRows[0]?.count ?? 0);
+    }
+  }
+
+  const [noteRows, spaceRows, whiteboardRows, usageRows] = await Promise.all([
+    db.select({ count: sql<number>`count(*)` }).from(notes).where(eq(notes.userId, userId)),
+    db.select({ count: sql<number>`count(*)` }).from(spaces).where(eq(spaces.userId, userId)),
+    db.select({ count: sql<number>`count(*)` }).from(whiteboards).where(eq(whiteboards.userId, userId)),
+    db.select({ actionCount: userAiUsage.actionCount }).from(userAiUsage)
+      .where(and(eq(userAiUsage.userId, userId), eq(userAiUsage.usageDate, today)))
+      .limit(1),
   ]);
 
   return {
-    boards: boardCount ?? 0,
-    tasks: taskCountData?.length ?? 0,
-    notes: noteCount ?? 0,
-    spaces: spaceCount ?? 0,
-    whiteboards: whiteboardCount ?? 0,
-    aiActionsToday: (usageData as any)?.action_count ?? 0,
+    boards: boardCount,
+    tasks: taskCount,
+    notes: Number(noteRows[0]?.count ?? 0),
+    spaces: Number(spaceRows[0]?.count ?? 0),
+    whiteboards: Number(whiteboardRows[0]?.count ?? 0),
+    aiActionsToday: usageRows[0]?.actionCount ?? 0,
     aiUsageDate: today,
   };
 }
@@ -162,19 +174,10 @@ export async function assertFreePlanLimit(kind: keyof Omit<typeof freePlanLimits
 
 export async function assertAiFeatureEnabled(feature: "aiRefineEnabled" | "aiTemplateBuilderEnabled" | "aiDiagramEnabled" | "aiAssistantEnabled") {
   const user = await getCurrentDatabaseUser();
-  const featureMap: Record<string, string> = {
-    aiRefineEnabled: "ai_refine_enabled",
-    aiTemplateBuilderEnabled: "ai_template_builder_enabled",
-    aiDiagramEnabled: "ai_diagram_enabled",
-    aiAssistantEnabled: "ai_assistant_enabled",
-  };
-  const { data: settings } = await supabase
-    .from("user_settings")
-    .select("*")
-    .eq("user_id", user.id)
-    .maybeSingle();
+  const rows = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+  const settings = rows[0];
 
-  if (settings && !settings[featureMap[feature]]) {
+  if (settings && !settings[feature]) {
     throw new Error("This AI feature is disabled in Settings.");
   }
 }
@@ -185,21 +188,19 @@ export async function recordAiAction() {
   const user = await getCurrentDatabaseUser();
   const today = new Date().toISOString().slice(0, 10);
 
-  const { data: existing } = await supabase
-    .from("user_ai_usage")
-    .select("action_count")
-    .eq("user_id", user.id)
-    .eq("usage_date", today)
-    .maybeSingle();
+  const existing = await db.select({ actionCount: userAiUsage.actionCount })
+    .from(userAiUsage)
+    .where(and(eq(userAiUsage.userId, user.id), eq(userAiUsage.usageDate, today)))
+    .limit(1);
 
-  const newCount = (existing?.action_count ?? 0) + 1;
+  const newCount = (existing[0]?.actionCount ?? 0) + 1;
 
-  await supabase
-    .from("user_ai_usage")
-    .upsert(
-      { user_id: user.id, usage_date: today, action_count: newCount, updated_at: new Date().toISOString() },
-      { onConflict: "user_id,usage_date" },
-    );
+  await db.insert(userAiUsage)
+    .values({ userId: user.id, usageDate: today, actionCount: newCount, updatedAt: new Date().toISOString() })
+    .onConflictDoUpdate({
+      target: [userAiUsage.userId, userAiUsage.usageDate],
+      set: { actionCount: newCount, updatedAt: new Date().toISOString() },
+    });
 
   if (newCount > freePlanLimits.aiActionsPerDay) {
     throw new Error(`Free plan limit reached: ${freePlanLimits.aiActionsPerDay} AI actions per day. Upgrade to Pro for unlimited AI.`);
@@ -209,36 +210,27 @@ export async function recordAiAction() {
 export async function exportCurrentUserData() {
   const user = await getCurrentDatabaseUser();
 
-  const [
-    { data: settings },
-    { data: categories },
-    { data: calendar },
-    { data: boards },
-    { data: userNotes },
-    { data: userSpaces },
-    { data: userWhiteboards },
-    { data: apps },
-  ] = await Promise.all([
-    supabase.from("user_settings").select("*").eq("user_id", user.id).maybeSingle(),
-    supabase.from("user_categories").select("*").eq("user_id", user.id),
-    supabase.from("calendar_items").select("*").eq("user_id", user.id),
-    supabase.from("kanban_boards").select("*").eq("user_id", user.id),
-    supabase.from("notes").select("*").eq("user_id", user.id),
-    supabase.from("spaces").select("*").eq("user_id", user.id),
-    supabase.from("whiteboards").select("*").eq("user_id", user.id),
-    supabase.from("generated_apps").select("*").eq("user_id", user.id),
+  const [settingsRows, categoriesRows, calendarRows, boardRows, noteRows, spaceRows, whiteboardRows, appRows] = await Promise.all([
+    db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1),
+    db.select().from(userCategories).where(eq(userCategories.userId, user.id)),
+    db.select().from(calendarItems).where(eq(calendarItems.userId, user.id)),
+    db.select().from(kanbanBoards).where(eq(kanbanBoards.userId, user.id)),
+    db.select().from(notes).where(eq(notes.userId, user.id)),
+    db.select().from(spaces).where(eq(spaces.userId, user.id)),
+    db.select().from(whiteboards).where(eq(whiteboards.userId, user.id)),
+    db.select().from(generatedApps).where(eq(generatedApps.userId, user.id)),
   ]);
 
   return {
     exportedAt: new Date().toISOString(),
     user: { email: user.email, name: user.name },
-    settings,
-    categories,
-    calendar,
-    kanbanBoards: boards,
-    notes: userNotes,
-    spaces: userSpaces,
-    whiteboards: userWhiteboards,
-    generatedApps: apps,
+    settings: settingsRows[0] ?? null,
+    categories: categoriesRows,
+    calendar: calendarRows,
+    kanbanBoards: boardRows,
+    notes: noteRows,
+    spaces: spaceRows,
+    whiteboards: whiteboardRows,
+    generatedApps: appRows,
   };
 }
