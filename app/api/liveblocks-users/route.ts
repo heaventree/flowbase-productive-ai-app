@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { inArray } from "drizzle-orm";
 
 import { db, users } from "@/db";
