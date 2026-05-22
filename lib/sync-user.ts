@@ -1,8 +1,9 @@
 import "server-only";
 
 import { currentUser } from "@clerk/nextjs/server";
+import { eq } from "drizzle-orm";
 
-import { supabase } from "@/db";
+import { db, users } from "@/db";
 import { getLiveblocksUserId, normalizeCollaborationEmail } from "@/lib/liveblocks";
 
 export async function syncCurrentUserToDatabase() {
@@ -22,15 +23,10 @@ export async function syncCurrentUserToDatabase() {
     normalizedEmail.split("@")[0] ||
     null;
 
-  await supabase
-    .from("users")
-    .upsert(
-      {
-        clerk_id: clerkId,
-        email: normalizedEmail,
-        liveblocks_id: getLiveblocksUserId(normalizedEmail),
-        name,
-      },
-      { onConflict: "clerk_id" },
-    );
+  await db.insert(users)
+    .values({ clerkId, email: normalizedEmail, liveblocksId: getLiveblocksUserId(normalizedEmail), name })
+    .onConflictDoUpdate({
+      target: users.clerkId,
+      set: { email: normalizedEmail, liveblocksId: getLiveblocksUserId(normalizedEmail), name },
+    });
 }
